@@ -159,6 +159,26 @@ def write_checkpoint(
     log.info("checkpoint %s written in %.0fs (%.1f MB)", label, time.time() - t0, (out / WEIGHTS_FILE).stat().st_size / 1e6)
 
 
+def load_packed(path: str, qspec: QSpec) -> dict[str, QResult]:
+    """Read back a pack-quantized checkpoint written by write_checkpoint (dev: resume from a stage)."""
+    from quant.packing import unpack_last_dim
+
+    results = {}
+    with safe_open(str(Path(path) / WEIGHTS_FILE), framework="pt") as sf:
+        keys = set(sf.keys())
+        for k in keys:
+            if not k.endswith(".weight_packed"):
+                continue
+            prefix = k[: -len(".weight_packed")]
+            out_f, in_f = sf.get_tensor(prefix + ".weight_shape").tolist()
+            codes = unpack_last_dim(sf.get_tensor(k), qspec.bits, in_f).to(torch.uint8)
+            scale = sf.get_tensor(prefix + ".weight_scale")
+            zp = sf.get_tensor(prefix + ".weight_zero_point")
+            zero = unpack_last_dim(zp.t().contiguous(), qspec.bits, out_f).t().contiguous().to(torch.uint8)
+            results[prefix + ".weight"] = QResult(codes, scale, zero)
+    return results
+
+
 # ------------------------------------------------------------------------------------------------ evaluation
 
 
@@ -245,6 +265,10 @@ def run(args) -> None:
         train = train[:-n_eval] if len(train) > 2 * n_eval else train
     score = lambda: ratio_proxy(model, eval_rows, n_eval) if eval_rows and eval_rows[0].reference_loss is not None else (mean_loss(model, eval_rows, n_eval), float("nan"))
 
+    init_from = os.environ.get("QUANT_INIT_FROM")
+    if init_from:
+        rtn_results = load_packed(init_from, qspec)
+        log.info("initialised from %s (%d linears)", init_from, len(rtn_results))
     set_weights(model, rtn_results, qspec.group)
     best_loss, best_r = score()
     best_name, best_results = "rtn", rtn_results
@@ -322,7 +346,8 @@ def run(args) -> None:
         last_write = [time.time()]
 
         def evaluate():
-            return mean_loss(model, eval_rows, n_eval)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                return mean_loss(model, eval_rows, n_eval)
 
         def current():
             res = {k: q.result() for k, q in qlinears.items()}
@@ -339,6 +364,12 @@ def run(args) -> None:
                 write_checkpoint(out, args.task_id, ckpt, base_config, qspec, spec, res, ov, label="tuned-partial")
                 last_write[0] = time.time()
 
+        teacher = None
+        kd_alpha = float(os.environ.get("QUANT_KD", 0.0))
+        if kd_alpha > 0:
+            teacher = common.load_model(src, device_map=device)
+            for p in teacher.parameters():
+                p.requires_grad_(False)
         budget = deadline.left() - tune_reserve
         best_tuned = tune.train_scales(
             model,
@@ -354,7 +385,10 @@ def run(args) -> None:
             budget_seconds=budget,
             eval_every=int(os.environ.get("QUANT_EVAL_EVERY", 100)),
             on_improve=on_improve,
+            teacher=teacher,
+            kd_alpha=kd_alpha,
         )
+        del teacher
         if best_tuned < best_loss:
             res, ov = current()
             ref = [r.reference_loss for r in eval_rows[:n_eval] if r.reference_loss is not None]

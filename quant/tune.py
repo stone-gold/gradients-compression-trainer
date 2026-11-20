@@ -27,6 +27,8 @@ class _QMatmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, qz, scale, group):
         out_f, in_f = qz.shape
+        ctx.in_dtype = x.dtype
+        x = x.to(torch.bfloat16)
         w = (qz.view(out_f, -1, group).to(x.dtype) * scale.to(x.dtype).unsqueeze(-1)).view(out_f, in_f)
         ctx.save_for_backward(x, qz, scale)
         ctx.group = group
@@ -37,8 +39,9 @@ class _QMatmul(torch.autograd.Function):
         x, qz, scale = ctx.saved_tensors
         group = ctx.group
         out_f, in_f = qz.shape
+        g = g.to(x.dtype)
         w = (qz.view(out_f, -1, group).to(x.dtype) * scale.to(x.dtype).unsqueeze(-1)).view(out_f, in_f)
-        grad_x = g.matmul(w)
+        grad_x = g.matmul(w).to(ctx.in_dtype)
         g2 = g.reshape(-1, out_f)
         x2 = x.reshape(-1, in_f)
         grad_w = g2.t().float().matmul(x2.float())  # [out, in]
@@ -125,9 +128,19 @@ def _ce_chunk(h, w, t):
     return F.cross_entropy(F.linear(h, w).float(), t, reduction="none")
 
 
-def supervised_ce(model, ids, labels, att, chunk: int = 4096):
-    """Mean over rows of each row's mean supervised-token CE, computing logits only at supervised positions, chunked
-    and recomputed in backward so the [tokens, vocab] logits never sit in memory."""
+def _kd_chunk(h, w, t, ht, wt, alpha: float):
+    logp = F.log_softmax(F.linear(h, w).float(), dim=-1)
+    ce = -logp.gather(1, t.view(-1, 1)).squeeze(1)
+    with torch.no_grad():
+        tlogp = F.log_softmax(F.linear(ht, wt).float(), dim=-1)
+    kl = (tlogp.exp() * (tlogp - logp)).sum(-1)
+    return (1 - alpha) * ce + alpha * kl
+
+
+def supervised_ce(model, ids, labels, att, chunk: int = 4096, teacher=None, alpha: float = 0.0):
+    """Mean over rows of each row's mean supervised-token loss, computing logits only at supervised positions, chunked
+    and recomputed in backward so the [tokens, vocab] logits never sit in memory. With a teacher, the per-token loss is
+    (1 - alpha) * CE + alpha * KL(teacher || student)."""
     decoder = model.get_decoder()
     head = model.get_output_embeddings()
     hs = decoder(input_ids=ids, attention_mask=att, use_cache=False).last_hidden_state
@@ -138,10 +151,20 @@ def supervised_ce(model, ids, labels, att, chunk: int = 4096):
     weight = (mask / n_row.clamp(min=1).unsqueeze(1))[mask]
     h = hs[:, :-1][mask]
     t = tg[mask]
+    ht = wt = None
+    if teacher is not None and alpha > 0:
+        with torch.no_grad():
+            ht = teacher.get_decoder()(input_ids=ids, attention_mask=att, use_cache=False).last_hidden_state[:, :-1][mask]
+            wt = teacher.get_output_embeddings().weight
     total = h.new_zeros((), dtype=torch.float32)
     for i in range(0, h.shape[0], chunk):
-        ce = torch.utils.checkpoint.checkpoint(_ce_chunk, h[i : i + chunk], head.weight, t[i : i + chunk], use_reentrant=False)
-        total = total + (ce * weight[i : i + chunk]).sum()
+        if ht is None:
+            loss = torch.utils.checkpoint.checkpoint(_ce_chunk, h[i : i + chunk], head.weight, t[i : i + chunk], use_reentrant=False)
+        else:
+            loss = torch.utils.checkpoint.checkpoint(
+                _kd_chunk, h[i : i + chunk], head.weight, t[i : i + chunk], ht[i : i + chunk], wt, alpha, use_reentrant=False
+            )
+        total = total + (loss * weight[i : i + chunk]).sum()
     return total / rows.sum().clamp(min=1)
 
 
@@ -170,6 +193,8 @@ def train_scales(
     eval_every: int = 100,
     on_improve=None,
     seed: int = 0,
+    teacher=None,
+    kd_alpha: float = 0.0,
 ):
     """Adam on the scale multipliers (and optionally norms/biases); keeps the best state by evaluate() (lower=better)."""
     device = next(p for p in model.parameters()).device
@@ -213,7 +238,7 @@ def train_scales(
             g["lr"] = (lr if gi == 0 else lr * 0.2) * f
         ids, labels, att = _collate(train_rows, idx, pad_id, device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = supervised_ce(model, ids, labels, att)
+            loss = supervised_ce(model, ids, labels, att, teacher=teacher, alpha=kd_alpha)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--n-calib", type=int, default=400)
     ap.add_argument("--n-test", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--calib-from-test", action="store_true", help="input model trained on all train rows: carve calibration from test")
     a = ap.parse_args()
     task_dir, out = Path(a.task_dir), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -44,7 +45,10 @@ def main():
     rng.shuffle(test)
     tok = load_quant_tokenizer(a.model)
     max_len = quant_eval_max_sequence_len(tok.context_len, 4096)
-    calib_rows, train_rows = train[: a.n_calib * 2], train[a.n_calib * 2 :]
+    if a.calib_from_test:
+        calib_rows, train_rows, test = test[: a.n_calib], train, test[a.n_calib :]
+    else:
+        calib_rows, train_rows = train[: a.n_calib * 2], train[a.n_calib * 2 :]
     calib = build_quant_eval_set(calib_rows, dt, tok, max_len).examples[: a.n_calib]
     test_build = build_quant_eval_set(test[: a.n_test * 2], dt, tok, max_len)
     (out / "calib_examples.jsonl").write_text(quant_eval_set_jsonl(calib))
