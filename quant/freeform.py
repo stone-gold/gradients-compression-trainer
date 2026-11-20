@@ -340,7 +340,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         # the RTN point closest to the aim from below, else the smallest c tried
         under = [(cc, rr) for cc, rr in rtn_hist if rr <= aim + 0.003]
         c = max(under)[0] if under else min(rtn_hist)[0]
-        c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.0))
+        c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.1))
     for k in range(max_probes):
         if probe_time is not None and deadline.left() < probe_time * 1.25 + 180:
             log.info("ECQ: no time for another probe (%.0fs left, probe %.0fs)", deadline.left(), probe_time)
