@@ -378,7 +378,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             a, b = line
             c_fit = math.exp((math.log(max(aim - 1.0, 1e-5)) - b) / a)
             c = min(c * 1.3, max(c / 1.3, c_fit))
-        c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.1))
+        c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.05))
     for k in range(max_probes):
         # GPTQ itself switches to RTN when less than ~1.2 x its time is left beyond a 300 s margin: never start a probe
         # that would degrade that way (it costs time and lands nowhere useful)
@@ -398,8 +398,22 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 st = ecq.floor_step(w, st, col, max_code)
             return ecq.gptq_u(w, H, st, damp=damp, act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1", col=col, rdo=rdo)
 
+        def group_quantizer(names, ws, H):
+            # stacked rows of linears sharing an input; per-row steps make the stack exact (no column factors here)
+            if col_alpha > 0:
+                return [quantizer(n, w, H) for n, w in zip(names, ws)]
+            sizes = [w.shape[0] for w in ws]
+            u = ecq.gptq_u(torch.cat(ws, 0), H, torch.cat([steps[n] for n in names]), damp=damp,
+                           act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1", rdo=rdo)
+            out, r0 = [], 0
+            for sz in sizes:
+                out.append(ecq.UResult(u.codes[r0 : r0 + sz].contiguous(), u.step[r0 : r0 + sz].contiguous()))
+                r0 += sz
+            return out
+
         lin = quantize_model_gptq(
-            model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer
+            model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer,
+            group_quantizer=group_quantizer if os.environ.get("QUANT_ECQ_GROUP_GPTQ", "1") == "1" else None,
         )
         lin = {n: q for n, q in lin.items() if n in base.shapes and not is_embed_like(n)}
         for n in names_2d:

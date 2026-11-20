@@ -237,6 +237,7 @@ def quantize_model_gptq(
     true_sequential: bool = True,
     time_left=lambda: float("inf"),
     quantizer=None,
+    group_quantizer=None,
 ) -> dict[str, QResult]:
     """Sequential GPTQ: each layer sees the outputs of the already-quantised layers before it.
 
@@ -299,6 +300,22 @@ def quantize_model_gptq(
                 stage = [n for n in order if first_input.get(n) == ptr]
             else:
                 stage = list(remaining)
+            if (
+                group_quantizer is not None
+                and not use_rtn
+                and len(stage) > 1
+                and all(Hs.get(n) is not None for n in stage)
+                and len({remaining[n].weight.shape[1] for n in stage}) == 1
+            ):
+                # Linears reading the same input (q/k/v, gate/up) share one Hessian: one GPTQ pass over their stacked rows
+                mods = [remaining.pop(n) for n in stage]
+                H = Hs[stage[0]] * (2.0 / max(1, counts[stage[0]]))
+                outs = group_quantizer([n + ".weight" for n in stage], [m.weight.data for m in mods], H)
+                for n, m, res in zip(stage, mods, outs):
+                    m.weight.data.copy_(res.dequant(spec.group, m.weight.dtype).to(m.weight.device))
+                    results[n + ".weight"] = res
+                    Hs[n] = None
+                stage = []
             for n in stage:
                 m = remaining.pop(n)
                 if use_rtn or Hs.get(n) is None:
