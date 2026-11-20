@@ -278,7 +278,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), int(os.environ.get("QUANT_ECQ_FISHER_LEN", 1024)))
         torch.cuda.empty_cache()
         log.info("Fisher in %.0fs", time.time() - t0)
-    embed_row = os.environ.get("QUANT_ECQ_EMBED_ROW", "0") == "1"
+    embed_row = os.environ.get("QUANT_ECQ_EMBED_ROW", "1") == "1"
     row_level = set() if alloc_kind != "fisher_row" else {n for n in names_2d if embed_row or n not in embed_names}
     clamp = {n: float(os.environ.get("QUANT_ECQ_EMBED_CLAMP" if n in embed_names else "QUANT_ECQ_ROW_CLAMP", 4.0)) for n in names_2d}
     alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, clamp)
@@ -313,7 +313,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         def quantizer(name, w, H):
             if H is None:
                 return ecq.rtn_u(w, steps[name], device=device)
-            return ecq.gptq_u(w, H, steps[name], damp=damp, act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "0") == "1")
+            return ecq.gptq_u(w, H, steps[name], damp=damp, act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1")
 
         lin = quantize_model_gptq(
             model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer
