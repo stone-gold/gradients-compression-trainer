@@ -149,12 +149,18 @@ def run(args) -> None:
 
     # 0. fallback: W8 g128 RTN on every 2-D weight
     t0 = time.time()
-    q8 = QSpec(bits=8, group=128)
+    fb_bits = int(os.environ.get("QUANT_FF_FALLBACK_BITS", 8))
+    q8 = QSpec(bits=fb_bits, group=128)
     fallback = {n: rtn(base.tensor(n), q8, device=device) for n in names_2d if group_for(base.shapes[n], 128)}
-    consider("rtn-w8g128", build_entries(base, fallback, 128, 8, {}, 128, 8), 1.0 + margin, force=True)
+    consider(f"rtn-w{fb_bits}g128", build_entries(base, fallback, 128, fb_bits, {}, 128, fb_bits), 1.0 + margin, force=True)
     log.info("fallback written in %.0fs", time.time() - t0)
     del fallback
     gc.collect()
+
+    cands = [tuple(int(x) for x in c.split(":")) for c in os.environ.get("QUANT_FF_CANDIDATES", "4:128,3:128").split(",") if c]
+    if not cands:
+        log.info("no GPTQ candidates: done with %s", best["name"])
+        return
 
     # 1. data and model
     tok = common.load_tokenizer(src)
@@ -180,7 +186,6 @@ def run(args) -> None:
                 params[n].data.copy_(base.tensor(n).to(params[n].dtype).to(params[n].device))
 
     embed_names = [n for n in names_2d if is_embed_like(n)]
-    cands = [tuple(int(x) for x in c.split(":")) for c in os.environ.get("QUANT_FF_CANDIDATES", "4:128,3:128").split(",") if c]
     embed_bits = [int(b) for b in os.environ.get("QUANT_FF_EMBED_BITS", "8,6,4").split(",") if b]
     emb_group = 128
     embed_q = {b: {n: rtn(base.tensor(n), QSpec(bits=b, group=emb_group), device=device) for n in embed_names if group_for(base.shapes[n], emb_group)} for b in embed_bits}
