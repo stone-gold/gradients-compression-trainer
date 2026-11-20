@@ -249,7 +249,7 @@ def run(args) -> None:
     calib, calib_meta = load_calibration(os.environ.get("QUANT_CALIBRATION_PATH"))
     dataset_type = json.loads(args.dataset_type or "{}")
     max_len = int(os.environ.get("QUANT_MAX_LEN", 2048))
-    n_train = int(os.environ.get("QUANT_TRAIN_ROWS", 4000))
+    n_train = int(os.environ.get("QUANT_TRAIN_ROWS", 30000))
     train = load_train_rows(args.task_id, args.dataset, dataset_type, tok, max_len, n_train)
 
     model = common.load_model(src, device_map=device)
@@ -287,9 +287,11 @@ def run(args) -> None:
             if p is not None:
                 p.data.copy_(ckpt.tensor(n).to(p.dtype).to(p.device))
         damp = float(os.environ.get("QUANT_DAMP", 0.01))
+        # GPTQ only seeds Block-AP's scales/zeros (RTN seeds it nearly as well), so it gets a small share
+        gptq_end = time.time() + float(os.environ.get("QUANT_GPTQ_SHARE", 0.12)) * deadline.left()
         t0 = time.time()
         gptq_results = quantize_model_gptq(
-            model, samples, qspec, damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300
+            model, samples, qspec, damp=damp, true_sequential=True, time_left=lambda: gptq_end - time.time()
         )
         log.info("GPTQ done in %.0fs", time.time() - t0)
         missing = [n for n in names if n not in gptq_results]
@@ -316,13 +318,13 @@ def run(args) -> None:
             pool,
             qspec,
             best_results,
-            n_chunks=int(os.environ.get("QUANT_BAP_CHUNKS", 512)),
+            n_chunks=int(os.environ.get("QUANT_BAP_CHUNKS", 2048)),
             length=int(os.environ.get("QUANT_BAP_LEN", 512)),
             batch=int(os.environ.get("QUANT_BAP_BATCH", 4)),
             epochs=int(os.environ.get("QUANT_BAP_EPOCHS", 4)),
-            lr_w=float(os.environ.get("QUANT_BAP_LR_W", 2e-5)),
-            lr_q=float(os.environ.get("QUANT_BAP_LR_Q", 1e-4)),
-            time_budget=float(os.environ.get("QUANT_BAP_SHARE", 0.4)) * deadline.left(),
+            lr_w=float(os.environ.get("QUANT_BAP_LR_W", 1e-4)),
+            lr_q=float(os.environ.get("QUANT_BAP_LR_Q", 3e-4)),
+            time_budget=float(os.environ.get("QUANT_BAP_SHARE", 0.45)) * deadline.left(),
         )
         if bap is not None:
             for n in names:
@@ -378,7 +380,7 @@ def run(args) -> None:
             evaluate,
             deadline.left,
             pad_id=tok.pad_token_id if tok.pad_token_id is not None else 0,
-            lr=float(os.environ.get("QUANT_TUNE_LR", 5e-4)),
+            lr=float(os.environ.get("QUANT_TUNE_LR", 1e-3)),
             train_norms=train_norms,
             max_tokens=int(os.environ.get("QUANT_TUNE_TOKENS", 16384)),
             epochs=float(os.environ.get("QUANT_TUNE_EPOCHS", 1.0)),

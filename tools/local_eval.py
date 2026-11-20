@@ -45,6 +45,16 @@ def score_one(model: str, base: str, test: str, spec_json: str | None) -> dict:
     from validator.evaluation.quant_vllm import resolved_model_config
 
     disable_humming_stream_k()
+    import os
+
+    util = os.environ.get("LOCAL_VLLM_GPU_UTIL")  # local only: share a GPU with another process (does not change logprobs)
+    if util:
+        import functools
+
+        import validator.evaluation.quant_vllm as qv
+
+        qv.LLM = functools.partial(qv.LLM, gpu_memory_utilization=float(util))
+        VllmPromptLogprobEngine = qv.VllmPromptLogprobEngine
     spec = QuantFixedSpec.model_validate_json(spec_json) if spec_json else None
     result = {"model": model}
     if spec is not None:

@@ -127,6 +127,13 @@ def blockap(
     device = next(model.parameters()).device
     layers = decoder_layers(model)
     names = module_names(model)
+    # three activation streams (quantised inputs, bf16 inputs, bf16 targets) live on the GPU: cap them at ~30% of free memory
+    hidden = model.config.get_text_config().hidden_size
+    free, _ = torch.cuda.mem_get_info()
+    cap = int(0.30 * free / (3 * length * hidden * 2))
+    if cap < n_chunks:
+        log.info("block-AP: %d chunks fit in memory (asked %d)", cap, n_chunks)
+        n_chunks = max(batch, cap)
     chunks = make_chunks(rows, n_chunks, length)
     n_chunks = (len(chunks) // batch) * batch
     chunks = chunks[:n_chunks]
