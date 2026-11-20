@@ -305,6 +305,42 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     tol = float(os.environ.get("QUANT_ECQ_TOL", 0.0015))
     probe_time = None
     log.info("ECQ: alloc %s, aim r %.4f, c0 %.4g, setup %.0fs", alloc.kind, aim, c, time.time() - t_start)
+
+    def secant(hist, target, c_now, r_now, jump):
+        a = 2.0
+        pts = [(math.log(cc), math.log(max(rr - 1.0, 1e-5))) for cc, rr in hist]
+        if len(pts) >= 2:
+            (x1, y1), (x2, y2) = pts[-2], pts[-1]
+            if abs(x2 - x1) > 1e-6:
+                a = min(4.0, max(1.0, (y2 - y1) / (x2 - x1)))
+        c_new = c_now * math.exp((math.log(max(target - 1.0, 1e-5)) - math.log(max(r_now - 1.0, 1e-5))) / a)
+        return min(c_now * jump, max(c_now / jump, c_new))
+
+    # Cheap bracketing with RTN onto the same grids (seconds per probe instead of minutes): GPTQ then starts at the
+    # RTN landing point, where its r is lower (safe side), and the secant steps up from there.
+    n_rtn = int(os.environ.get("QUANT_ECQ_RTN_PROBES", 4))
+    rtn_hist: list[tuple[float, float]] = []
+    for k in range(n_rtn):
+        if deadline.left() < 600:
+            break
+        t0 = time.time()
+        restore()
+        steps = alloc.steps(c)
+        res = {n: ecq.rtn_u(params[n].data, steps[n], device=device) for n in names_2d if n in params}
+        set_weights(model, res, 0)
+        del res
+        with torch.no_grad():
+            r = mean_loss(model, eval_rows) / ref_loss
+        rtn_hist.append((c, r))
+        log.info("ECQ RTN probe %d: c %.5g r %.4f (%.0fs)", k, c, r, time.time() - t0)
+        if abs(r - aim) <= 0.003:
+            break
+        c = secant(rtn_hist, aim, c, r, 8.0)
+    if rtn_hist:
+        # the RTN point closest to the aim from below, else the smallest c tried
+        under = [(cc, rr) for cc, rr in rtn_hist if rr <= aim + 0.003]
+        c = max(under)[0] if under else min(rtn_hist)[0]
+        c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.0))
     for k in range(max_probes):
         if probe_time is not None and deadline.left() < probe_time * 1.25 + 180:
             log.info("ECQ: no time for another probe (%.0fs left, probe %.0fs)", deadline.left(), probe_time)
@@ -349,14 +385,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         if abs(r - aim) <= tol:
             break
         # secant in log space: log(r - 1) = a log c + b (a ~ 2 for uniform noise); one point -> a = 2
-        a = 2.0
-        pts = [(math.log(cc), math.log(max(rr - 1.0, 1e-5))) for cc, rr in history]
-        if len(pts) >= 2:
-            (x1, y1), (x2, y2) = pts[-2], pts[-1]
-            if abs(x2 - x1) > 1e-6:
-                a = min(4.0, max(1.0, (y2 - y1) / (x2 - x1)))
-        c_new = c * math.exp((math.log(max(aim - 1.0, 1e-5)) - math.log(max(r - 1.0, 1e-5))) / a)
-        c = min(c * 4.0, max(c / 4.0, c_new))
+        c = secant(history, aim, c, r, 4.0)
     log.info("ECQ history (c, r): %s", ", ".join(f"({cc:.4g}, {rr:.4f})" for cc, rr in history))
     del model
     gc.collect()
