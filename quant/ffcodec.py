@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import torch
 import zstandard
 
@@ -36,10 +37,18 @@ class Entry:
             return {"data": self.tensor.to(torch.bfloat16).contiguous().cpu().view(torch.uint8).numpy().tobytes()}
         q = self.q
         if isinstance(q, UResult):
-            return {
-                "codes": q.codes.to(torch.int8).contiguous().cpu().numpy().tobytes(),
-                "step": q.step.to(torch.float32).contiguous().cpu().numpy().tobytes(),
-            }
+            codes = q.codes.to(torch.int8).contiguous().cpu().numpy()
+            out = {"step": q.step.to(torch.float32).contiguous().cpu().numpy().tobytes()}
+            if os.environ.get("QUANT_FF_ROWSORT", "1") == "1" and codes.shape[0] > 1:
+                # rows stored in order of a 1-byte spread key (stable sort), so zstd's per-block Huffman tables see rows
+                # of similar code entropy together (-2.3% on t05); the decoder rebuilds the order from the key bytes
+                spread = np.abs(codes.astype(np.float32)).mean(1)
+                key = np.clip(np.round(16.0 * np.log2(spread + 1e-3)) + 128, 0, 255).astype(np.uint8)
+                perm = np.argsort(key, kind="stable")
+                out["rowkey"] = key.tobytes()
+                codes = np.ascontiguousarray(codes[perm])
+            out["codes"] = codes.tobytes()
+            return out
         return {
             "codes": q.codes.to(torch.uint8).contiguous().cpu().numpy().tobytes(),
             "scale": q.scale.to(torch.bfloat16).contiguous().cpu().view(torch.uint8).numpy().tobytes(),
@@ -127,7 +136,7 @@ def write_artifact(out: Path, task_id: str, records: list[dict], frames: list[by
     tensors = []
     for rec in records:
         r = dict(rec)
-        for key in ("data", "codes", "scale", "zero", "step"):
+        for key in ("data", "codes", "scale", "zero", "step", "rowkey"):
             if key in r:
                 r[key] = list(where[r[key]])
         tensors.append(r)

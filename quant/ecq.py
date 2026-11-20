@@ -126,7 +126,7 @@ class Allocation:
     """step[name] = c * base[name]; base from Fisher (step ~ 1/sqrt(f)) or from the weights' RMS (uniform bits)."""
 
     def __init__(self, shapes: dict[str, list[int]], weights_rms: dict[str, torch.Tensor], fisher: dict[str, torch.Tensor] | None,
-                 row_level: set[str], row_clamp: float = 4.0):
+                 row_level: set[str], row_clamp: float | dict = 4.0):
         self.base: dict[str, torch.Tensor] = {}
         self.numel = {n: math.prod(shapes[n]) for n in weights_rms}
         if fisher is None:
@@ -143,7 +143,8 @@ class Allocation:
             ft = max(tensor_f.get(n, 0.0), floor)
             b = torch.full((shapes[n][0],), 1.0 / math.sqrt(ft))
             if f is not None and n in row_level:
-                rel = (ft / f.clamp(min=ft * 1e-6)).sqrt().clamp(1.0 / row_clamp, row_clamp)
+                rc = row_clamp.get(n, 4.0) if isinstance(row_clamp, dict) else row_clamp
+                rel = (ft / f.clamp(min=ft * 1e-6)).sqrt().clamp(1.0 / rc, rc)
                 b = b * rel
             self.base[n] = b
 

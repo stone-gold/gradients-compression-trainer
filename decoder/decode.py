@@ -7,7 +7,8 @@ zstd frame. Tensor encodings:
        entropy coder does the bit packing), scale bf16 [out, in/group], zero uint8 [out, in/group];
        w = bf16((code - zero) * scale), computed in float32 (bit-identical to the trainer's dequant).
   u:   uniform (entropy-coded) quantisation per output row. codes int8 [out, in], step float32 [out];
-       w = bf16(code * step[row]), computed in float32.
+       w = bf16(code * step[row]), computed in float32. Optional rowkey uint8 [out]: the codes blob holds the rows in
+       np.argsort(rowkey, kind="stable") order.
 Output: top-level *.safetensors with exactly the tensors listed, all bf16. Deterministic: no randomness, no threads
 racing on shared output.
 """
@@ -98,6 +99,12 @@ def decode_tensor(blobs: Blobs, t: dict) -> torch.Tensor:
     if t["enc"] == "u":
         out_f, in_f = shape
         codes = torch.frombuffer(blobs.get(t["codes"], out_f * in_f), dtype=torch.int8).view(out_f, in_f)
+        if "rowkey" in t:  # rows were stored sorted (stable) by a 1-byte key: put them back
+            key = np.frombuffer(bytes(blobs.get(t["rowkey"], out_f)), dtype=np.uint8)
+            perm = torch.from_numpy(np.argsort(key, kind="stable").astype(np.int64))
+            unsorted = torch.empty_like(codes)
+            unsorted[perm] = codes
+            codes = unsorted
         step = torch.frombuffer(blobs.get(t["step"], 4 * out_f), dtype=torch.float32)
         return dequant_u(codes, step)
     raise SystemExit(f"unknown encoding {t['enc']}")

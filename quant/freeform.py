@@ -278,8 +278,10 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), int(os.environ.get("QUANT_ECQ_FISHER_LEN", 1024)))
         torch.cuda.empty_cache()
         log.info("Fisher in %.0fs", time.time() - t0)
-    row_level = set() if alloc_kind != "fisher_row" else {n for n in names_2d if n not in embed_names}
-    alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, float(os.environ.get("QUANT_ECQ_ROW_CLAMP", 4.0)))
+    embed_row = os.environ.get("QUANT_ECQ_EMBED_ROW", "0") == "1"
+    row_level = set() if alloc_kind != "fisher_row" else {n for n in names_2d if embed_row or n not in embed_names}
+    clamp = {n: float(os.environ.get("QUANT_ECQ_EMBED_CLAMP" if n in embed_names else "QUANT_ECQ_ROW_CLAMP", 4.0)) for n in names_2d}
+    alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, clamp)
     alloc.set_floor({n: base.tensor(n).float().abs().amax(1) for n in names_2d}, float(os.environ.get("QUANT_ECQ_MAX_CODE", 100)))
 
     aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.002))
