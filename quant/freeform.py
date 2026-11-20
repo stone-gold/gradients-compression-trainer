@@ -333,6 +333,9 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     def rtn_curve(hist):
         """least-squares line log(r - 1) = a log c + b over the RTN probes (None with < 2 usable points)."""
         pts = [(math.log(cc), math.log(rr - 1.0)) for cc, rr in hist if rr - 1.0 > 0.002]
+        near = [(x, y) for x, y in pts if 0.008 < math.exp(y) < 0.1]  # the curve bends: fit the part near the aim
+        if len(near) >= 2:
+            pts = near
         if len(pts) < 2:
             return None
         mx = sum(x for x, _ in pts) / len(pts)
@@ -398,7 +401,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     for k in range(max_probes):
         # GPTQ itself switches to RTN when less than ~1.2 x its time is left beyond a 300 s margin: never start a probe
         # that would degrade that way (it costs time and lands nowhere useful)
-        if probe_time is not None and deadline.left() < probe_time * 1.3 + 360:
+        if probe_time is not None and deadline.left() < probe_time * float(os.environ.get("QUANT_ECQ_GATE_MULT", 1.15)) + 330:
             log.info("ECQ: no time for another probe (%.0fs left, probe %.0fs)", deadline.left(), probe_time)
             break
         t0 = time.time()
