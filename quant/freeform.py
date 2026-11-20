@@ -259,6 +259,10 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     """ECQ (quant/ecq.py): GPTQ onto per-row uniform grids, steps = c * Fisher allocation, c searched so the
     calibration r lands just under the knee. Each probe is a full candidate (written when its predicted S is best)."""
     t_start = time.time()
+    # Hessian accumulation X^T X (fp32, e.g. 18944-wide down_proj inputs over ~0.5M tokens per layer) dominates a GPTQ probe on
+    # 7-8B models; TF32 tensor cores run it several times faster (H100: ~7x the fp32 rate). GPTQ is damped, so the reduced mantissa
+    # in the Hessian does not matter. Freeform only: the fixed track keeps full fp32.
+    torch.backends.cuda.matmul.allow_tf32 = os.environ.get("QUANT_ECQ_TF32", "1") == "1"
     tok = common.load_tokenizer(src)
     calib, _ = load_calibration(os.environ.get("QUANT_CALIBRATION_PATH"))
     dataset_type = json.loads(args.dataset_type or "{}")
