@@ -388,5 +388,62 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         # secant in log space: log(r - 1) = a log c + b (a ~ 2 for uniform noise); one point -> a = 2
         c = secant(history, aim, c, r, 4.0)
     log.info("ECQ history (c, r): %s", ", ".join(f"({cc:.4g}, {rr:.4f})" for cc, rr in history))
+
+    # Block-AP on the ECQ grid (EfficientQAT, Chen et al. 2024, arXiv:2407.11062): rounding learned per block against
+    # the bf16 block outputs lowers r at a given step, so larger steps (fewer bytes) fit under the knee.
+    if os.environ.get("QUANT_ECQ_BAP", "0") == "1" and history:
+        from quant.blockap import blockap
+
+        feasible = [cc for cc, rr in history if rr + margin <= target["knee"]]
+        c_b = (max(feasible) if feasible else min(history)[0]) * float(os.environ.get("QUANT_ECQ_BAP_GAIN", 1.15))
+        bap_hist: list[tuple[float, float]] = []
+        bap_time = None
+        lin_names = [n for n in names_2d if not is_embed_like(n)]
+        for k in range(int(os.environ.get("QUANT_ECQ_BAP_PROBES", 3))):
+            left = deadline.left()
+            if left < 600 or (bap_time is not None and left < bap_time * 1.25 + 180):
+                log.info("ECQ Block-AP: no time for probe %d (%.0fs left)", k, left)
+                break
+            t0 = time.time()
+            restore()
+            steps = alloc.steps(c_b)
+            init = {n: steps[n] for n in lin_names}
+            res = blockap(
+                model,
+                pool,
+                QSpec(bits=8, group=1),
+                init,
+                n_chunks=int(os.environ.get("QUANT_ECQ_BAP_CHUNKS", 512)),
+                length=int(os.environ.get("QUANT_ECQ_BAP_LEN", 512)),
+                batch=int(os.environ.get("QUANT_ECQ_BAP_BATCH", 4)),
+                epochs=int(os.environ.get("QUANT_ECQ_BAP_EPOCHS", 2)),
+                lr_w=float(os.environ.get("QUANT_ECQ_BAP_LR", 1e-4)),
+                lr_q=1e-4,
+                time_budget=max(60.0, deadline.left() - 300),
+                fake_factory=lambda m, st: ecq.FakeQuantLinearU(m, st, learn_step=os.environ.get("QUANT_ECQ_BAP_LEARN_STEP", "0") == "1"),
+            )
+            if res is None:
+                log.info("ECQ Block-AP: does not fit the budget")
+                break
+            lin = {n: q for n, q in res.items() if n in base.shapes}
+            for n in names_2d:
+                if n not in lin:
+                    lin[n] = ecq.rtn_u(base.tensor(n), steps[n], device=device)
+            set_weights(model, {n: lin[n] for n in names_2d if is_embed_like(n) or n not in res}, 0)
+            with torch.no_grad():
+                loss = mean_loss(model, eval_rows)
+            r = loss / ref_loss
+            bap_hist.append((c_b, r))
+            entries = [ffcodec.Entry(name, shape, q=lin[name]) if name in lin else ffcodec.Entry(name, shape, tensor=base.tensor(name)) for name, shape in base.shapes.items()]
+            log.info("ECQ Block-AP probe %d: c %.5g r %.4f (%.0fs)", k, c_b, r, time.time() - t0)
+            consider(f"ecq-bap-c{c_b:.4g}", entries, r + margin)
+            bap_time = time.time() - t0
+            del entries, lin, res
+            gc.collect()
+            torch.cuda.empty_cache()
+            if abs(r - aim) <= tol:
+                break
+            c_b = secant(bap_hist, aim, c_b, r, 2.0)
+        log.info("ECQ Block-AP history (c, r): %s", ", ".join(f"({cc:.4g}, {rr:.4f})" for cc, rr in bap_hist))
     del model
     gc.collect()

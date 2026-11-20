@@ -52,6 +52,9 @@ class FakeQuantLinear(nn.Module):
     def forward(self, x):
         return F.linear(x, self.qweight().to(x.dtype), self.bias)
 
+    def qparams(self) -> list:
+        return [self.scale, self.zero]
+
     @torch.no_grad()
     def result(self) -> QResult:
         g, maxq = self.spec.group, self.spec.maxq
@@ -122,6 +125,7 @@ def blockap(
     lr_w: float = 2e-5,
     lr_q: float = 1e-4,
     time_budget: float = float("inf"),
+    fake_factory=None,
 ) -> dict[str, QResult] | None:
     """Returns {weight name: QResult} or None when the time budget cannot fit. Model weights end dequantised."""
     device = next(model.parameters()).device
@@ -155,16 +159,17 @@ def blockap(
         for n, m in linears.items():
             parent_name, _, child = n.rpartition(".")
             parent = model.get_submodule(parent_name)
-            f = FakeQuantLinear(m, init[n + ".weight"], spec)
+            f = FakeQuantLinear(m, init[n + ".weight"], spec) if fake_factory is None else fake_factory(m, init[n + ".weight"])
             setattr(parent, child, f)
             fq[n] = (parent, child, m, f)
         for p in layer.parameters():
             p.requires_grad_(False)
         wparams = [f.weight for (_, _, _, f) in fq.values()]
-        qparams = [p for (_, _, _, f) in fq.values() for p in (f.scale, f.zero)]
+        qparams = [p for (_, _, _, f) in fq.values() for p in f.qparams()]
         for p in wparams + qparams:
             p.requires_grad_(True)
-        opt = torch.optim.AdamW([{"params": wparams, "lr": lr_w}, {"params": qparams, "lr": lr_q}], weight_decay=0.0)
+        groups = [{"params": wparams, "lr": lr_w}] + ([{"params": qparams, "lr": lr_q}] if qparams else [])
+        opt = torch.optim.AdamW(groups, weight_decay=0.0)
         steps = epochs * nb
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps)
         layer.train()

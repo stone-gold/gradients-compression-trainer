@@ -222,3 +222,34 @@ class Allocation:
         tot = sum(self.numel.values())
         lg = sum(self.numel[n] * math.log(float(self.base[n].mean()) / (float(rms[n].pow(2).mean().sqrt()) + 1e-12)) for n in self.base)
         return step_over_rms / math.exp(lg / tot)
+
+
+class FakeQuantLinearU(torch.nn.Module):
+    """Block-AP on the ECQ grid: latent weights with straight-through rounding onto step[row] * {-127..127}.
+    Steps stay fixed unless learn_step (fixed steps keep the rate set by the step search)."""
+
+    def __init__(self, linear, step: torch.Tensor, learn_step: bool = False):
+        super().__init__()
+        self.weight = torch.nn.Parameter(linear.weight.detach().float().clone())
+        st = step.to(linear.weight.device).float().clone()
+        self.step = torch.nn.Parameter(st) if learn_step else None
+        self.register_buffer("step_fixed", st)
+        self.bias = linear.bias
+
+    def _s(self):
+        return (self.step if self.step is not None else self.step_fixed).clamp(min=1e-12).unsqueeze(1)
+
+    def forward(self, x):
+        s = self._s()
+        z = self.weight / s
+        q = torch.clamp(z + (torch.round(z) - z).detach(), -QMAX, QMAX)
+        return F.linear(x, (q * s).to(x.dtype), self.bias)
+
+    def qparams(self) -> list:
+        return [self.step] if self.step is not None else []
+
+    @torch.no_grad()
+    def result(self) -> UResult:
+        s = self._s()
+        q = torch.clamp(torch.round(self.weight / s), -QMAX, QMAX).to(torch.int8)
+        return UResult(q.cpu(), s.squeeze(1).float().cpu())
