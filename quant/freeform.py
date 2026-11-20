@@ -284,7 +284,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, clamp)
     alloc.set_floor({n: base.tensor(n).float().abs().amax(1) for n in names_2d}, float(os.environ.get("QUANT_ECQ_MAX_CODE", 100)))
 
-    aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.002))
+    aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.001))
     # start: geometric-mean step / weight RMS = 0.2 (~4.4 bits/weight for Gaussian weights); the empirical Fisher of a
     # row's mean loss is ~1/tokens of the per-token curvature, so its absolute scale is not used, only its shape
     c = alloc.c_for_ratio(float(os.environ.get("QUANT_ECQ_STEP_OVER_RMS", 0.2)), rms)
@@ -317,6 +317,33 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         c_new = c_now * math.exp((math.log(max(target - 1.0, 1e-5)) - math.log(max(r_now - 1.0, 1e-5))) / a)
         return min(c_now * jump, max(c_now / jump, c_new))
 
+    def rtn_curve(hist):
+        """least-squares line log(r - 1) = a log c + b over the RTN probes (None with < 2 usable points)."""
+        pts = [(math.log(cc), math.log(rr - 1.0)) for cc, rr in hist if rr - 1.0 > 0.002]
+        if len(pts) < 2:
+            return None
+        mx = sum(x for x, _ in pts) / len(pts)
+        my = sum(y for _, y in pts) / len(pts)
+        sxx = sum((x - mx) ** 2 for x, _ in pts)
+        if sxx < 1e-9:
+            return None
+        a = sum((x - mx) * (y - my) for x, y in pts) / sxx
+        return max(1.0, min(6.0, a)), my - max(1.0, min(6.0, a)) * mx
+
+    def next_gptq_c(hist, rhist, target, c_now, r_now):
+        """GPTQ's r(c) is the RTN curve shifted to larger c: estimate the shift from the latest GPTQ probe, use the RTN
+        slope (models differ a lot: ~2 on 0.5-1.5B fine-tunes, ~4.6 on Qwen3-8B-Base), and move at most 1.25x."""
+        line = rtn_curve(rhist)
+        if line is None:
+            return secant(hist, target, c_now, r_now, 1.5)
+        a, _b = line
+        if len(hist) >= 2:  # GPTQ's own slope once two GPTQ points exist, bounded by the RTN slope's range
+            (x1, y1), (x2, y2) = [(math.log(cc), math.log(max(rr - 1.0, 1e-5))) for cc, rr in hist[-2:]]
+            if abs(x2 - x1) > 1e-6:
+                a = max(1.0, min(6.0, (y2 - y1) / (x2 - x1)))
+        c_new = c_now * math.exp((math.log(max(target - 1.0, 1e-5)) - math.log(max(r_now - 1.0, 1e-5))) / a)
+        return min(c_now * 1.25, max(c_now / 1.25, c_new))
+
     # Cheap bracketing with RTN onto the same grids (seconds per probe instead of minutes): GPTQ then starts at the
     # RTN landing point, where its r is lower (safe side), and the secant steps up from there.
     n_rtn = int(os.environ.get("QUANT_ECQ_RTN_PROBES", 4))
@@ -336,14 +363,26 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         log.info("ECQ RTN probe %d: c %.5g r %.4f (%.0fs)", k, c, r, time.time() - t0)
         if abs(r - aim) <= 0.003:
             break
-        c = secant(rtn_hist, aim, c, r, 8.0)
+        line = rtn_curve(rtn_hist)
+        if line is None:
+            c = secant(rtn_hist, aim, c, r, 8.0)
+        else:
+            a, b = line
+            c = min(c * 8.0, max(c / 8.0, math.exp((math.log(max(aim - 1.0, 1e-5)) - b) / a)))
     if rtn_hist:
         # the RTN point closest to the aim from below, else the smallest c tried
         under = [(cc, rr) for cc, rr in rtn_hist if rr <= aim + 0.003]
         c = max(under)[0] if under else min(rtn_hist)[0]
+        line = rtn_curve(rtn_hist)
+        if line is not None:  # the fitted RTN line at the aim is less noisy than any single probe
+            a, b = line
+            c_fit = math.exp((math.log(max(aim - 1.0, 1e-5)) - b) / a)
+            c = min(c * 1.3, max(c / 1.3, c_fit))
         c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.1))
     for k in range(max_probes):
-        if probe_time is not None and deadline.left() < probe_time * 1.25 + 180:
+        # GPTQ itself switches to RTN when less than ~1.2 x its time is left beyond a 300 s margin: never start a probe
+        # that would degrade that way (it costs time and lands nowhere useful)
+        if probe_time is not None and deadline.left() < probe_time * 1.3 + 360:
             log.info("ECQ: no time for another probe (%.0fs left, probe %.0fs)", deadline.left(), probe_time)
             break
         t0 = time.time()
@@ -386,7 +425,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         if abs(r - aim) <= tol:
             break
         # secant in log space: log(r - 1) = a log c + b (a ~ 2 for uniform noise); one point -> a = 2
-        c = secant(history, aim, c, r, 4.0)
+        c = next_gptq_c(history, rtn_hist, aim, c, r)
     log.info("ECQ history (c, r): %s", ", ".join(f"({cc:.4g}, {rr:.4f})" for cc, rr in history))
 
     # Block-AP on the ECQ grid (EfficientQAT, Chen et al. 2024, arXiv:2407.11062): rounding learned per block against
