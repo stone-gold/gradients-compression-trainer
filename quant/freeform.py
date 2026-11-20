@@ -425,7 +425,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
 
         lin = quantize_model_gptq(
             model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer,
-            group_quantizer=group_quantizer if os.environ.get("QUANT_ECQ_GROUP_GPTQ", "1") == "1" else None,
+            group_quantizer=group_quantizer if os.environ.get("QUANT_ECQ_GROUP_GPTQ", "0") == "1" else None,
         )
         lin = {n: q for n, q in lin.items() if n in base.shapes and not is_embed_like(n)}
         for n in names_2d:
