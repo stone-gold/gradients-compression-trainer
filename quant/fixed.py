@@ -221,6 +221,16 @@ def set_weights(model, results: dict[str, QResult], group: int) -> None:
 # ------------------------------------------------------------------------------------------------ main
 
 
+def _bap_budget(left: float, tune_reserve: float, size_b: float) -> float:
+    """Block-AP's share of the time left; when tuning could not get a useful slot afterwards anyway (short budgets on
+    large models: 7B at 0.5 h left ~13 min idle), Block-AP gets all of it but a write/eval margin."""
+    budget = float(os.environ.get("QUANT_BAP_SHARE", 0.45)) * left
+    if left - budget < tune_reserve + 600:
+        budget = max(budget, left - 180 - 30 * size_b)
+        log.info("Block-AP gets %.0fs of %.0fs left (no room for tuning after it)", budget, left)
+    return budget
+
+
 def run(args) -> None:
     deadline = common.Deadline.from_hours(args.hours_to_complete)
     spec = parse_spec(args)
@@ -305,6 +315,9 @@ def run(args) -> None:
             write_checkpoint(out, args.task_id, ckpt, base_config, qspec, spec, gptq_results, label="gptq")
 
     # 4. block-wise reconstruction (Block-AP), initialised from the best scales/zeros so far
+    # final write + eval measured on H100: ~35 s for 7B (17 s write, 17 s eval); keep a wide margin
+    size_b = sum(math.prod(ckpt.shapes[n]) for n in names) / 1e9
+    tune_reserve = float(os.environ.get("QUANT_TUNE_RESERVE", 150 + 30 * size_b))
     if os.environ.get("QUANT_BLOCKAP", "1") == "1" and pool and deadline.left() > 900:
         from quant.blockap import blockap
 
@@ -324,7 +337,7 @@ def run(args) -> None:
             epochs=int(os.environ.get("QUANT_BAP_EPOCHS", 4)),
             lr_w=float(os.environ.get("QUANT_BAP_LR_W", 1e-4)),
             lr_q=float(os.environ.get("QUANT_BAP_LR_Q", 3e-4)),
-            time_budget=float(os.environ.get("QUANT_BAP_SHARE", 0.45)) * deadline.left(),
+            time_budget=_bap_budget(deadline.left(), tune_reserve, size_b),
         )
         if bap is not None:
             for n in names:
@@ -338,7 +351,6 @@ def run(args) -> None:
         set_weights(model, best_results, qspec.group)
 
     # 5. end-to-end scale tuning on train rows, codes frozen
-    tune_reserve = 240 + 60 * (sum(math.prod(ckpt.shapes[n]) for n in names) / 1e9)
     if os.environ.get("QUANT_TUNE", "1") == "1" and train and deadline.left() > tune_reserve + 300:
         from quant import tune
 
@@ -383,7 +395,7 @@ def run(args) -> None:
             lr=float(os.environ.get("QUANT_TUNE_LR", 1e-3)),
             train_norms=train_norms,
             max_tokens=int(os.environ.get("QUANT_TUNE_TOKENS", 16384)),
-            epochs=float(os.environ.get("QUANT_TUNE_EPOCHS", 1.0)),
+            epochs=float(os.environ.get("QUANT_TUNE_EPOCHS", 3.0)),
             budget_seconds=budget,
             eval_every=int(os.environ.get("QUANT_EVAL_EVERY", 100)),
             on_improve=on_improve,
