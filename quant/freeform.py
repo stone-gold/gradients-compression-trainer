@@ -75,9 +75,10 @@ def penalised(total_bytes: int, r: float, target: dict) -> float:
 def freeform_target() -> dict:
     t = common.quant_target()
     return {
-        "knee": float(t.get("knee", 1.04)),
-        "cap": float(t.get("cap", 1.08)),
-        "penalty_curvature": float(t.get("penalty_curvature", 2500.0)),
+        # QUANT_TARGET is QuantTarget.model_dump_json(): unset fields arrive as null, not missing
+        "knee": float(t.get("knee") or 1.04),
+        "cap": float(t.get("cap") or 1.08),
+        "penalty_curvature": float(t.get("penalty_curvature") if t.get("penalty_curvature") is not None else 2500.0),
     }
 
 
@@ -157,7 +158,10 @@ def run(args) -> None:
     del fallback
     gc.collect()
 
-    cands = [tuple(int(x) for x in c.split(":")) for c in os.environ.get("QUANT_FF_CANDIDATES", "4:128,3:128").split(",") if c]
+    raw_cands = os.environ.get("QUANT_FF_CANDIDATES", "auto")
+    auto = raw_cands == "auto"
+    # auto: start at W4 g128; above the knee step up a bit (to W8), comfortably under it try one bit fewer (to W3).
+    cands = [(4, 128)] if auto else [tuple(int(x) for x in c.split(":")) for c in raw_cands.split(",") if c]
     if not cands:
         log.info("no GPTQ candidates: done with %s", best["name"])
         return
@@ -190,7 +194,11 @@ def run(args) -> None:
     emb_group = 128
     embed_q = {b: {n: rtn(base.tensor(n), QSpec(bits=b, group=emb_group), device=device) for n in embed_names if group_for(base.shapes[n], emb_group)} for b in embed_bits}
 
-    for bits, group in cands:
+    tried = set()
+    while cands:
+        bits, group = cands.pop(0)
+        tried.add((bits, group))
+        r_min = float("inf")
         # rough time check: GPTQ ~ a few minutes per B params on an H100; leave room for encode + write
         if deadline.left() < 600:
             log.warning("out of time before candidate W%d g%d", bits, group)
@@ -212,6 +220,7 @@ def run(args) -> None:
             with torch.no_grad():
                 loss = mean_loss(model, eval_rows)
             r = loss / ref_loss
+            r_min = min(r_min, r)
             log.info("W%dg%d emb%d: eval loss %.5f r %.4f", bits, group, eb, loss, r)
             consider(f"gptq-w{bits}g{group}-emb{eb}", build_entries(base, lin, group, bits, embed_q[eb], emb_group, eb), r + margin)
             params = dict(model.named_parameters())
@@ -220,6 +229,12 @@ def run(args) -> None:
                     params[n].data.copy_(t.to(params[n].dtype).to(params[n].device))
             if deadline.left() < 300:
                 break
+        if auto:
+            nxt = (bits + 1, group) if r_min + margin > target["knee"] else (bits - 1, group)
+            if 3 <= nxt[0] <= 8 and nxt not in tried and not (nxt[0] < bits and r_min + margin > target["knee"]):
+                # going down only from a candidate under the knee; going up only while over it
+                if nxt[0] > bits or best["name"] and best["name"].startswith(f"gptq-w{bits}g"):
+                    cands.append(nxt)
     log.info("final: %s, %s bytes, predicted r %s, predicted S %.1f MB, %.0fs elapsed", best["name"], best["bytes"], best["r"], best["S"] / 1e6, deadline.elapsed())
     del model
     gc.collect()

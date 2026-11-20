@@ -104,12 +104,18 @@ def is_chat(dt: dict) -> bool:
     return "chat_column" in dt or "chat_template" in dt
 
 
-def tokenize_rows(rows: list[dict], dt: dict, tok, max_len: int) -> list[Row]:
+def tokenize_rows(rows: list[dict], dt: dict, tok, max_len: int, time_limit: float | None = None) -> list[Row]:
+    import time
+
+    t_end = None if time_limit is None else time.time() + time_limit
     out = []
     if is_chat(dt):
         labeller = _HfChat(tok, _resolve_template(dt.get("chat_template"), tok))
         role_map = chat_role_map(dt.get("chat_user_reference"), dt.get("chat_assistant_reference"))
-    for raw in rows:
+    for i, raw in enumerate(rows):
+        if t_end is not None and i % 256 == 0 and time.time() > t_end:
+            log.warning("tokenisation time limit reached after %d rows", i)
+            break
         try:
             if is_chat(dt):
                 messages = chat_messages(
@@ -160,6 +166,6 @@ def load_train_rows(task_id: str, dataset_arg: str, dt: dict, tok, max_len: int,
         rows = next((v for v in rows.values() if isinstance(v, list)), [])
     rng = random.Random(seed)
     rng.shuffle(rows)
-    out = tokenize_rows(rows[: limit * 2], dt, tok, max_len)[:limit]
+    out = tokenize_rows(rows[: limit * 2], dt, tok, max_len, time_limit=float(os.environ.get("QUANT_TOKENIZE_SECONDS", 90)))[:limit]
     log.info("train split %s: %d rows on disk, %d tokenised", path, len(rows), len(out))
     return out
