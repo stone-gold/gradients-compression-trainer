@@ -313,7 +313,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         def quantizer(name, w, H):
             if H is None:
                 return ecq.rtn_u(w, steps[name], device=device)
-            return ecq.gptq_u(w, H, steps[name], damp=damp)
+            return ecq.gptq_u(w, H, steps[name], damp=damp, act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "0") == "1")
 
         lin = quantize_model_gptq(
             model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer

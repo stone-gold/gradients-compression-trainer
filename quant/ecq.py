@@ -46,7 +46,7 @@ def rtn_u(weight: torch.Tensor, step: torch.Tensor, device="cuda") -> UResult:
 
 
 @torch.no_grad()
-def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: float = 0.01, blocksize: int = 128) -> UResult:
+def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: float = 0.01, blocksize: int = 128, act_order: bool = True) -> UResult:
     """GPTQ in natural column order onto the grid step[row] * {-127..127}. weight [out, in], H [in, in] fp32 on GPU."""
     W = weight.to(device=H.device, dtype=torch.float32).clone()
     out_f, in_f = W.shape
@@ -55,6 +55,11 @@ def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: floa
     dead = torch.diag(H) == 0
     H[dead, dead] = 1
     W[:, dead] = 0
+    perm = None
+    if act_order:  # columns by decreasing Hessian diagonal (free here: no groups tie columns to scales)
+        perm = torch.argsort(torch.diag(H), descending=True)
+        W = W[:, perm]
+        H = H[perm][:, perm]
     H += damp * torch.mean(torch.diag(H)) * torch.eye(in_f, device=H.device)
     try:
         L = torch.linalg.cholesky(H)
@@ -77,6 +82,10 @@ def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: floa
             W1[:, i:] -= err.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
             Err1[:, i] = err
         W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+    if perm is not None:
+        unperm = torch.empty_like(codes)
+        unperm[:, perm] = codes
+        codes = unperm
     return UResult(codes.cpu(), step.float().cpu())
 
 
