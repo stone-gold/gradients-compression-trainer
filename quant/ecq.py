@@ -67,12 +67,23 @@ def floor_step(weight: torch.Tensor, step: torch.Tensor, col: torch.Tensor | Non
     return torch.maximum(step.float().to(w.device), w.amax(1) / max_code).cpu()
 
 
+def rate_table(weight: torch.Tensor, step: torch.Tensor, device) -> torch.Tensor:
+    """bits[code + QMAX] = -log2 p(code), p from this tensor's RTN codes on the same grid (add-0.5 smoothing)."""
+    q = torch.clamp(torch.round(weight.to(device=device, dtype=torch.float32) / step.to(device).float().unsqueeze(1)), -QMAX, QMAX)
+    hist = torch.bincount((q + QMAX).long().flatten(), minlength=2 * QMAX + 1).float() + 0.5
+    return -torch.log2(hist / hist.sum())
+
+
 def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: float = 0.01, blocksize: int = 128, act_order: bool = True,
-           col: torch.Tensor | None = None) -> UResult:
+           col: torch.Tensor | None = None, rdo: float = 0.0) -> UResult:
+    """rdo > 0: rate-distortion-optimised rounding. Each weight takes floor or ceil of x = w / grid by the smaller
+    (x - q)^2 + rdo * bits(q), bits from the tensor's code histogram (RDOQ as in H.264/HEVC encoders; for uniform
+    quantisation at high rate dD/dR = -2 ln2 D, so rdo ~ 2 ln2 / 12 = 0.116 balances them)."""
     """GPTQ onto the grid step[row] * col[column] * {-127..127}. weight [out, in], H [in, in] fp32 on GPU."""
     W = weight.to(device=H.device, dtype=torch.float32).clone()
     out_f, in_f = W.shape
     s_row = step.to(device=H.device, dtype=torch.float32)
+    bits = rate_table(W, s_row, H.device) if rdo > 0 else None
     c_col = None if col is None else col.to(device=H.device, dtype=torch.float32)
     H = H.clone()
     dead = torch.diag(H) == 0
@@ -102,7 +113,15 @@ def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: floa
         for i in range(i2 - i1):
             w = W1[:, i]
             s = s_row if c_col is None else s_row * c_col[i1 + i]  # same fp32 product as UResult.grid()
-            q = torch.clamp(torch.round(w / s), -QMAX, QMAX)
+            if bits is None:
+                q = torch.clamp(torch.round(w / s), -QMAX, QMAX)
+            else:
+                x = w / s
+                lo = torch.clamp(torch.floor(x), -QMAX, QMAX)
+                hi = torch.clamp(lo + 1, -QMAX, QMAX)
+                c_lo = (x - lo).pow(2) + rdo * bits[(lo + QMAX).long()]
+                c_hi = (x - hi).pow(2) + rdo * bits[(hi + QMAX).long()]
+                q = torch.where(c_hi < c_lo, hi, lo)
             codes[:, i1 + i] = q.to(torch.int8)
             err = (w - q * s) / Hinv1[i, i]
             W1[:, i:] -= err.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
