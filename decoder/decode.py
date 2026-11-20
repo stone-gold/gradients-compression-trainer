@@ -8,7 +8,7 @@ zstd frame. Tensor encodings:
        w = bf16((code - zero) * scale), computed in float32 (bit-identical to the trainer's dequant).
   u:   uniform (entropy-coded) quantisation per output row. codes int8 [out, in], step float32 [out];
        w = bf16(code * step[row]), computed in float32. Optional rowkey uint8 [out]: the codes blob holds the rows in
-       np.argsort(rowkey, kind="stable") order.
+       np.argsort(rowkey, kind="stable") order. Optional col float32 [in]: w = bf16(code * (step[row] * col[column])).
 Output: top-level *.safetensors with exactly the tensors listed, all bf16. Deterministic: no randomness, no threads
 racing on shared output.
 """
@@ -73,13 +73,17 @@ def dequant(codes: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor, group:
     return result
 
 
-def dequant_u(codes: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
-    """codes int8 [out, in], step float32 [out] -> bf16 [out, in]."""
+def dequant_u(codes: torch.Tensor, step: torch.Tensor, col: torch.Tensor | None = None) -> torch.Tensor:
+    """codes int8 [out, in], step float32 [out], col float32 [in] or None -> bf16 [out, in];
+    w = bf16(code * (step[i] * col[j])) in float32 (the product order the trainer uses)."""
     out_f, in_f = codes.shape
     result = torch.empty((out_f, in_f), dtype=torch.bfloat16)
     rows = max(1, (1 << 24) // in_f)
     for r in range(0, out_f, rows):
-        result[r : r + rows] = (codes[r : r + rows].float() * step[r : r + rows].unsqueeze(1)).to(torch.bfloat16)
+        g = step[r : r + rows].unsqueeze(1)
+        if col is not None:
+            g = g * col.unsqueeze(0)
+        result[r : r + rows] = (codes[r : r + rows].float() * g).to(torch.bfloat16)
     return result
 
 
@@ -106,7 +110,8 @@ def decode_tensor(blobs: Blobs, t: dict) -> torch.Tensor:
             unsorted[perm] = codes
             codes = unsorted
         step = torch.frombuffer(blobs.get(t["step"], 4 * out_f), dtype=torch.float32)
-        return dequant_u(codes, step)
+        col = torch.frombuffer(blobs.get(t["col"], 4 * in_f), dtype=torch.float32) if "col" in t else None
+        return dequant_u(codes, step, col)
     raise SystemExit(f"unknown encoding {t['enc']}")
 
 

@@ -32,9 +32,14 @@ IGNORE_INDEX = -100
 class UResult:
     codes: torch.Tensor  # int8 [out, in]
     step: torch.Tensor  # fp32 [out]
+    col: torch.Tensor | None = None  # fp32 [in] or None: grid of weight (i, j) is step[i] * col[j]
+
+    def grid(self) -> torch.Tensor:
+        s = self.step.float().unsqueeze(1).to(self.codes.device)
+        return s if self.col is None else s * self.col.float().unsqueeze(0).to(self.codes.device)
 
     def dequant(self, group: int = 0, dtype=torch.bfloat16) -> torch.Tensor:  # group unused (QResult-compatible)
-        return (self.codes.float() * self.step.float().unsqueeze(1).to(self.codes.device)).to(dtype)
+        return (self.codes.float() * self.grid()).to(dtype)
 
 
 @torch.no_grad()
@@ -46,11 +51,29 @@ def rtn_u(weight: torch.Tensor, step: torch.Tensor, device="cuda") -> UResult:
 
 
 @torch.no_grad()
-def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: float = 0.01, blocksize: int = 128, act_order: bool = True) -> UResult:
-    """GPTQ in natural column order onto the grid step[row] * {-127..127}. weight [out, in], H [in, in] fp32 on GPU."""
+def column_factors(H: torch.Tensor, alpha: float, clamp: float) -> torch.Tensor:
+    """col[j] ~ (H_jj / geomean H)^(-alpha/2), clamped to [1/clamp, clamp], geometric mean ~1 (fp32 [in], CPU)."""
+    d = torch.diag(H).float().clamp(min=1e-12)
+    ld = d.log()
+    ld = ld - ld.median()
+    return torch.exp(-0.5 * alpha * ld).clamp(1.0 / clamp, clamp).cpu()
+
+
+def floor_step(weight: torch.Tensor, step: torch.Tensor, col: torch.Tensor | None, max_code: float) -> torch.Tensor:
+    """step[i] >= max_j |w_ij| / col[j] / max_code: codes stay inside int8 with headroom for GPTQ's updates."""
+    w = weight.float().abs()
+    if col is not None:
+        w = w / col.to(w.device).unsqueeze(0)
+    return torch.maximum(step.float().to(w.device), w.amax(1) / max_code).cpu()
+
+
+def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: float = 0.01, blocksize: int = 128, act_order: bool = True,
+           col: torch.Tensor | None = None) -> UResult:
+    """GPTQ onto the grid step[row] * col[column] * {-127..127}. weight [out, in], H [in, in] fp32 on GPU."""
     W = weight.to(device=H.device, dtype=torch.float32).clone()
     out_f, in_f = W.shape
-    s = step.to(device=H.device, dtype=torch.float32)
+    s_row = step.to(device=H.device, dtype=torch.float32)
+    c_col = None if col is None else col.to(device=H.device, dtype=torch.float32)
     H = H.clone()
     dead = torch.diag(H) == 0
     H[dead, dead] = 1
@@ -60,6 +83,8 @@ def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: floa
         perm = torch.argsort(torch.diag(H), descending=True)
         W = W[:, perm]
         H = H[perm][:, perm]
+        if c_col is not None:
+            c_col = c_col[perm]
     H += damp * torch.mean(torch.diag(H)) * torch.eye(in_f, device=H.device)
     try:
         L = torch.linalg.cholesky(H)
@@ -76,6 +101,7 @@ def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: floa
         Hinv1 = Hinv[i1:i2, i1:i2]
         for i in range(i2 - i1):
             w = W1[:, i]
+            s = s_row if c_col is None else s_row * c_col[i1 + i]  # same fp32 product as UResult.grid()
             q = torch.clamp(torch.round(w / s), -QMAX, QMAX)
             codes[:, i1 + i] = q.to(torch.int8)
             err = (w - q * s) / Hinv1[i, i]
@@ -86,7 +112,7 @@ def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: floa
         unperm = torch.empty_like(codes)
         unperm[:, perm] = codes
         codes = unperm
-    return UResult(codes.cpu(), step.float().cpu())
+    return UResult(codes.cpu(), step.float().cpu(), None if col is None else col.float().cpu())
 
 
 def fisher_rows(model, rows, names: list[str], n_rows: int, max_len: int) -> dict[str, torch.Tensor]:

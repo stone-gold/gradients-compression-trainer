@@ -39,6 +39,8 @@ class Entry:
         if isinstance(q, UResult):
             codes = q.codes.to(torch.int8).contiguous().cpu().numpy()
             out = {"step": q.step.to(torch.float32).contiguous().cpu().numpy().tobytes()}
+            if q.col is not None:
+                out["col"] = q.col.to(torch.float32).contiguous().cpu().numpy().tobytes()
             if os.environ.get("QUANT_FF_ROWSORT", "1") == "1" and codes.shape[0] > 1:
                 # rows stored in order of a 1-byte spread key (stable sort), so zstd's per-block Huffman tables see rows
                 # of similar code entropy together (-2.3% on t05); the decoder rebuilds the order from the key bytes
@@ -136,7 +138,7 @@ def write_artifact(out: Path, task_id: str, records: list[dict], frames: list[by
     tensors = []
     for rec in records:
         r = dict(rec)
-        for key in ("data", "codes", "scale", "zero", "step", "rowkey"):
+        for key in ("data", "codes", "scale", "zero", "step", "rowkey", "col"):
             if key in r:
                 r[key] = list(where[r[key]])
         tensors.append(r)

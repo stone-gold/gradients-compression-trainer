@@ -297,6 +297,9 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 params[n].data.copy_(base.tensor(n).to(params[n].dtype).to(params[n].device))
 
     damp = float(os.environ.get("QUANT_DAMP", 0.01))
+    col_alpha = float(os.environ.get("QUANT_ECQ_COL_ALPHA", 0.0))  # >0: per-column step factors from the Hessian diagonal
+    col_clamp = float(os.environ.get("QUANT_ECQ_COL_CLAMP", 4.0))
+    max_code = float(os.environ.get("QUANT_ECQ_MAX_CODE", 100))
     history: list[tuple[float, float]] = []
     max_probes = int(os.environ.get("QUANT_ECQ_PROBES", 5))
     tol = float(os.environ.get("QUANT_ECQ_TOL", 0.0015))
@@ -313,7 +316,11 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         def quantizer(name, w, H):
             if H is None:
                 return ecq.rtn_u(w, steps[name], device=device)
-            return ecq.gptq_u(w, H, steps[name], damp=damp, act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1")
+            col, st = None, steps[name]
+            if col_alpha > 0:
+                col = ecq.column_factors(H, col_alpha, col_clamp)
+                st = ecq.floor_step(w, st, col, max_code)
+            return ecq.gptq_u(w, H, st, damp=damp, act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1", col=col)
 
         lin = quantize_model_gptq(
             model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer
