@@ -142,7 +142,16 @@ def run(args) -> None:
         est = ffcodec.encoded_size(frames) + 2048 + HF_GITATTRIBUTES_BYTES + decoder_xz_estimate()
         S = penalised(est, r_pred, target)
         log.info("candidate %s: ~%.1f MB, predicted r %.4f, predicted S %.1f MB (best %s %.1f MB)", name, est / 1e6, r_pred, S / 1e6, best["name"], best["S"] / 1e6)
-        if (force or S < best["S"]) and deadline.left() > 60:
+        # r_pred = measured calibration r + margin. A candidate predicted over the knee never replaces one predicted under
+        # it (the small predicted penalty is not worth the risk of a real one); one under the knee always beats one over.
+        feasible = r_pred <= target["knee"]
+        # (the W8 fallback does not count: a slightly penalised 4-bit result is still far smaller than it)
+        best_feasible = best["r"] is not None and best["r"] <= target["knee"] and not str(best["name"]).startswith("rtn-")
+        if not force and best_feasible and not feasible:
+            log.info("candidate %s predicted over the knee: kept %s", name, best["name"])
+            return
+        better = S < best["S"] or (feasible and not best_feasible)
+        if (force or better) and deadline.left() > 60:
             info = {"candidate": name, "predicted_r": r_pred}
             total = ffcodec.write_artifact(out, args.task_id, records, frames, info)
             best.update(S=S, name=name, r=r_pred, bytes=total)
@@ -376,7 +385,10 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         line = rtn_curve(rtn_hist)
         if line is not None:  # the fitted RTN line at the aim is less noisy than any single probe
             a, b = line
-            c_fit = math.exp((math.log(max(aim - 1.0, 1e-5)) - b) / a)
+            # first GPTQ probe aims below the aim (more so on large models, where only ~2 GPTQ probes fit a short budget):
+            # if the second probe overshoots, the first is still a valid under-knee result
+            first_aim = aim - float(os.environ.get("QUANT_ECQ_FIRST_UNDER", 0.005 if base.bf16_bytes() > 8e9 else 0.002))
+            c_fit = math.exp((math.log(max(first_aim - 1.0, 1e-5)) - b) / a)
             c = min(c * 1.3, max(c / 1.3, c_fit))
         c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.05))
     for k in range(max_probes):
