@@ -187,9 +187,15 @@ def blockap(
         x_fp = y_fp
         dt = time.time() - tl
         log.info("blockap layer %d/%d mse %.3e -> %.3e (%.1fs)", li + 1, len(layers), first / nb, last / nb, dt)
-        if li == 0 and dt * len(layers) > time_budget:
-            log.warning("block-AP needs ~%.0fs > budget %.0fs: abort", dt * len(layers), time_budget)
-            return None
+        if li == 0:
+            per_epoch = dt / epochs
+            fit = int((time_budget - dt) / max(1e-6, per_epoch * (len(layers) - 1)))
+            if fit < 1:
+                log.warning("block-AP needs ~%.0fs > budget %.0fs: abort", per_epoch * len(layers), time_budget)
+                return None
+            if fit < epochs:
+                log.info("block-AP: %d epochs per layer fit the budget (asked %d)", fit, epochs)
+                epochs = fit
     torch.cuda.empty_cache()
     log.info("block-AP done in %.0fs", time.time() - t0)
     return results

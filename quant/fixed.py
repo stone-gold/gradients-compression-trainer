@@ -148,6 +148,14 @@ def write_checkpoint(
         if stale.name not in ("config.json", WEIGHTS_FILE) and stale.is_file():
             stale.unlink()
     common.write_manifest(out, task_id, "fixed", ["config.json", WEIGHTS_FILE])
+    stage_dir = os.environ.get("QUANT_STAGE_DIR")  # local testing: keep a copy of every stage
+    if stage_dir:
+        import shutil
+
+        dest = Path(stage_dir) / label
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in ("config.json", WEIGHTS_FILE):
+            shutil.copy2(out / name, dest / name)
     log.info("checkpoint %s written in %.0fs (%.1f MB)", label, time.time() - t0, (out / WEIGHTS_FILE).stat().st_size / 1e6)
 
 
@@ -284,13 +292,13 @@ def run(args) -> None:
             pool,
             qspec,
             best_results,
-            n_chunks=int(os.environ.get("QUANT_BAP_CHUNKS", 256)),
+            n_chunks=int(os.environ.get("QUANT_BAP_CHUNKS", 512)),
             length=int(os.environ.get("QUANT_BAP_LEN", 512)),
             batch=int(os.environ.get("QUANT_BAP_BATCH", 4)),
-            epochs=int(os.environ.get("QUANT_BAP_EPOCHS", 2)),
+            epochs=int(os.environ.get("QUANT_BAP_EPOCHS", 4)),
             lr_w=float(os.environ.get("QUANT_BAP_LR_W", 2e-5)),
             lr_q=float(os.environ.get("QUANT_BAP_LR_Q", 1e-4)),
-            time_budget=0.5 * deadline.left(),
+            time_budget=float(os.environ.get("QUANT_BAP_SHARE", 0.4)) * deadline.left(),
         )
         if bap is not None:
             for n in names:

@@ -13,6 +13,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from quant.data import IGNORE_INDEX
 from quant.data import Row
@@ -120,6 +121,30 @@ def _collate(rows: list[Row], idx: list[int], pad_id: int, device):
     return ids.to(device), labels.to(device), att.to(device)
 
 
+def _ce_chunk(h, w, t):
+    return F.cross_entropy(F.linear(h, w).float(), t, reduction="none")
+
+
+def supervised_ce(model, ids, labels, att, chunk: int = 4096):
+    """Mean over rows of each row's mean supervised-token CE, computing logits only at supervised positions, chunked
+    and recomputed in backward so the [tokens, vocab] logits never sit in memory."""
+    decoder = model.get_decoder()
+    head = model.get_output_embeddings()
+    hs = decoder(input_ids=ids, attention_mask=att, use_cache=False).last_hidden_state
+    tg = labels[:, 1:]
+    mask = tg != IGNORE_INDEX
+    n_row = mask.sum(1)
+    rows = n_row > 0
+    weight = (mask / n_row.clamp(min=1).unsqueeze(1))[mask]
+    h = hs[:, :-1][mask]
+    t = tg[mask]
+    total = h.new_zeros((), dtype=torch.float32)
+    for i in range(0, h.shape[0], chunk):
+        ce = torch.utils.checkpoint.checkpoint(_ce_chunk, h[i : i + chunk], head.weight, t[i : i + chunk], use_reentrant=False)
+        total = total + (ce * weight[i : i + chunk]).sum()
+    return total / rows.sum().clamp(min=1)
+
+
 def per_row_ce(logits, labels):
     """[B] mean supervised-token CE per row (shifted), and a mask of rows with a supervised token."""
     lg = logits[:, :-1].float()
@@ -188,9 +213,7 @@ def train_scales(
             g["lr"] = (lr if gi == 0 else lr * 0.2) * f
         ids, labels, att = _collate(train_rows, idx, pad_id, device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            logits = model(input_ids=ids, attention_mask=att, use_cache=False).logits
-        ce, has = per_row_ce(logits, labels)
-        loss = ce[has].mean()
+            loss = supervised_ce(model, ids, labels, att)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
