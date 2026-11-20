@@ -126,7 +126,7 @@ def run(args) -> None:
     src = common.model_dir(args.model)
     base = BaseTensors(src)
     margin = float(os.environ.get("QUANT_FF_MARGIN", 0.006))
-    level = int(os.environ.get("QUANT_FF_ZSTD", 9))
+    level = int(os.environ.get("QUANT_FF_ZSTD", 0))  # 0 = Huffman-only frames (ffcodec._params)
     log.info("freeform task %s: model %s (%.2f GB bf16), target %s, budget %.0fs", args.task_id, src, base.bf16_bytes() / 1e9, target, deadline.left())
     device = "cuda" if torch.cuda.is_available() else "cpu"
     names_2d = [n for n, s in base.shapes.items() if len(s) == 2 and n.endswith(".weight")]

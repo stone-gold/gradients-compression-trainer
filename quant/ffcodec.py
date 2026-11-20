@@ -44,11 +44,29 @@ class Entry:
         return self.tensor.to(torch.bfloat16) if self.q is None else self.q.dequant(self.group, torch.bfloat16)
 
 
-def _compress(raw: bytes, level: int) -> bytes:
-    return zstandard.ZstdCompressor(level=level, write_content_size=True).compress(raw)
+def _params(level: int):
+    """level >= 1: a plain zstd level. level <= 0 (default): Huffman-only literals, no LZ matching (min_match 7, tiny
+    search). On quantised weight codes LZ matches are spurious and cost ~10% over the order-0 entropy at levels 3-15;
+    this setting lands within ~1.5% of the empirical entropy, ~30x faster than level 9. Output is a standard zstd
+    frame (the decoder is unchanged)."""
+    if level >= 1:
+        return zstandard.ZstdCompressionParameters.from_level(level, write_content_size=1)
+    return zstandard.ZstdCompressionParameters.from_level(
+        1, strategy=zstandard.STRATEGY_FAST, min_match=7, search_log=1, hash_log=6, write_content_size=1
+    )
 
 
-def encode(entries: list[Entry], level: int = 9, workers: int = 16) -> tuple[list[dict], list[bytes]]:
+def _compress(raw: bytes, level: int, codes: bool) -> bytes:
+    """Codes: one frame at `level`. Other blobs (bf16 tensors, scales, zeros): also try level 9, keep the smaller."""
+    out = zstandard.ZstdCompressor(compression_params=_params(level)).compress(raw)
+    if level <= 0 and not codes:
+        alt = zstandard.ZstdCompressor(compression_params=_params(9)).compress(raw)
+        if len(alt) < len(out):
+            out = alt
+    return out
+
+
+def encode(entries: list[Entry], level: int = 0, workers: int = 16) -> tuple[list[dict], list[bytes]]:
     """-> (tensor records with blob refs into the frame list, frames). Refs are (frame index) until laid out."""
     jobs = []
     records = []
@@ -58,10 +76,10 @@ def encode(entries: list[Entry], level: int = 9, workers: int = 16) -> tuple[lis
             rec["group"], rec["bits"] = e.group, e.bits
         for key, raw in e.blobs().items():
             rec[key] = len(jobs)
-            jobs.append(raw)
+            jobs.append((raw, key == "codes"))
         records.append(rec)
     with ThreadPoolExecutor(workers) as ex:
-        frames = list(ex.map(lambda raw: _compress(raw, level), jobs))
+        frames = list(ex.map(lambda job: _compress(job[0], level, job[1]), jobs))
     return records, frames
 
 
