@@ -24,6 +24,7 @@ import torch
 from safetensors import safe_open
 
 from quant import common
+from quant import ecq
 from quant import ffcodec
 from quant.data import load_calibration
 from quant.data import load_train_rows
@@ -158,6 +159,11 @@ def run(args) -> None:
     del fallback
     gc.collect()
 
+    if os.environ.get("QUANT_FF_MODE", "ecq") == "ecq":
+        run_ecq(args, deadline, target, base, names_2d, consider, best, margin, device, src)
+        log.info("final: %s, %s bytes, predicted r %s, predicted S %.1f MB, %.0fs elapsed", best["name"], best["bytes"], best["r"], best["S"] / 1e6, deadline.elapsed())
+        return
+
     raw_cands = os.environ.get("QUANT_FF_CANDIDATES", "auto")
     auto = raw_cands == "auto"
     # auto: start at W4 g128; above the knee step up a bit (to W8), comfortably under it try one bit fewer (to W3).
@@ -236,5 +242,112 @@ def run(args) -> None:
                 if nxt[0] > bits or best["name"] and best["name"].startswith(f"gptq-w{bits}g"):
                     cands.append(nxt)
     log.info("final: %s, %s bytes, predicted r %s, predicted S %.1f MB, %.0fs elapsed", best["name"], best["bytes"], best["r"], best["S"] / 1e6, deadline.elapsed())
+    del model
+    gc.collect()
+
+
+def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, device, src) -> None:
+    """ECQ (quant/ecq.py): GPTQ onto per-row uniform grids, steps = c * Fisher allocation, c searched so the
+    calibration r lands just under the knee. Each probe is a full candidate (written when its predicted S is best)."""
+    t_start = time.time()
+    tok = common.load_tokenizer(src)
+    calib, _ = load_calibration(os.environ.get("QUANT_CALIBRATION_PATH"))
+    dataset_type = json.loads(args.dataset_type or "{}")
+    max_len = int(os.environ.get("QUANT_MAX_LEN", 2048))
+    train = load_train_rows(args.task_id, args.dataset, dataset_type, tok, max_len, int(os.environ.get("QUANT_TRAIN_ROWS", 2000)))
+    n_eval = int(os.environ.get("QUANT_EVAL_ROWS", 400))
+    eval_rows = [r for r in calib if r.n_scored > 0][:n_eval]
+    if not eval_rows:
+        eval_rows, train = train[-min(200, len(train) // 4) :], train[: -min(200, len(train) // 4)]
+    model = common.load_model(src, device_map=device)
+    with torch.no_grad():
+        ref_loss = mean_loss(model, eval_rows)
+    log.info("bf16 loss on %d eval rows: %.5f", len(eval_rows), ref_loss)
+    pool = train if len(train) >= 128 else calib + train
+    samples = [torch.tensor(r.input_ids) for r in pool[: int(os.environ.get("QUANT_GPTQ_ROWS", 256))]]
+    embed_names = [n for n in names_2d if is_embed_like(n)]
+    params = dict(model.named_parameters())
+    rms = {n: base.tensor(n).float().pow(2).mean(1).sqrt() for n in names_2d}
+
+    alloc_kind = os.environ.get("QUANT_ECQ_ALLOC", "fisher_row")
+    log.info("ECQ alloc %s", alloc_kind)
+    fisher = None
+    if alloc_kind.startswith("fisher"):
+        t0 = time.time()
+        frows = [r for r in pool if r.n_scored > 0][-int(os.environ.get("QUANT_ECQ_FISHER_ROWS", 128)) :]
+        fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), int(os.environ.get("QUANT_ECQ_FISHER_LEN", 1024)))
+        torch.cuda.empty_cache()
+        log.info("Fisher in %.0fs", time.time() - t0)
+    row_level = set() if alloc_kind != "fisher_row" else {n for n in names_2d if n not in embed_names}
+    alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, float(os.environ.get("QUANT_ECQ_ROW_CLAMP", 4.0)))
+    alloc.set_floor({n: base.tensor(n).float().abs().amax(1) for n in names_2d}, float(os.environ.get("QUANT_ECQ_MAX_CODE", 100)))
+
+    aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.002))
+    # start: geometric-mean step / weight RMS = 0.2 (~4.4 bits/weight for Gaussian weights); the empirical Fisher of a
+    # row's mean loss is ~1/tokens of the per-token curvature, so its absolute scale is not used, only its shape
+    c = alloc.c_for_ratio(float(os.environ.get("QUANT_ECQ_STEP_OVER_RMS", 0.2)), rms)
+    if os.environ.get("QUANT_ECQ_C0"):
+        c = float(os.environ["QUANT_ECQ_C0"])
+
+    def restore():
+        for n in names_2d:
+            if n in params:
+                params[n].data.copy_(base.tensor(n).to(params[n].dtype).to(params[n].device))
+
+    damp = float(os.environ.get("QUANT_DAMP", 0.01))
+    history: list[tuple[float, float]] = []
+    max_probes = int(os.environ.get("QUANT_ECQ_PROBES", 5))
+    tol = float(os.environ.get("QUANT_ECQ_TOL", 0.0015))
+    probe_time = None
+    log.info("ECQ: alloc %s, aim r %.4f, c0 %.4g, setup %.0fs", alloc.kind, aim, c, time.time() - t_start)
+    for k in range(max_probes):
+        if probe_time is not None and deadline.left() < probe_time * 1.25 + 180:
+            log.info("ECQ: no time for another probe (%.0fs left, probe %.0fs)", deadline.left(), probe_time)
+            break
+        t0 = time.time()
+        restore()
+        steps = alloc.steps(c)
+
+        def quantizer(name, w, H):
+            if H is None:
+                return ecq.rtn_u(w, steps[name], device=device)
+            return ecq.gptq_u(w, H, steps[name], damp=damp)
+
+        lin = quantize_model_gptq(
+            model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer
+        )
+        lin = {n: q for n, q in lin.items() if n in base.shapes and not is_embed_like(n)}
+        for n in names_2d:
+            if n not in lin:
+                lin[n] = ecq.rtn_u(base.tensor(n), steps[n], device=device)
+        set_weights(model, lin, 0)
+        with torch.no_grad():
+            loss = mean_loss(model, eval_rows)
+        r = loss / ref_loss
+        history.append((c, r))
+        entries = []
+        for name, shape in base.shapes.items():
+            if name in lin:
+                entries.append(ffcodec.Entry(name, shape, q=lin[name]))
+            else:
+                entries.append(ffcodec.Entry(name, shape, tensor=base.tensor(name)))
+        clipped = sum(int((q.codes.abs() == ecq.QMAX).sum()) for q in lin.values())
+        log.info("ECQ probe %d: c %.5g, eval loss %.5f r %.4f, clipped codes %d, %.0fs", k, c, loss, r, clipped, time.time() - t0)
+        consider(f"ecq-{alloc.kind}-c{c:.4g}", entries, r + margin)
+        probe_time = time.time() - t0
+        del entries, lin
+        gc.collect()
+        if abs(r - aim) <= tol:
+            break
+        # secant in log space: log(r - 1) = a log c + b (a ~ 2 for uniform noise); one point -> a = 2
+        a = 2.0
+        pts = [(math.log(cc), math.log(max(rr - 1.0, 1e-5))) for cc, rr in history]
+        if len(pts) >= 2:
+            (x1, y1), (x2, y2) = pts[-2], pts[-1]
+            if abs(x2 - x1) > 1e-6:
+                a = min(4.0, max(1.0, (y2 - y1) / (x2 - x1)))
+        c_new = c * math.exp((math.log(max(aim - 1.0, 1e-5)) - math.log(max(r - 1.0, 1e-5))) / a)
+        c = min(c * 4.0, max(c / 4.0, c_new))
+    log.info("ECQ history (c, r): %s", ", ".join(f"({cc:.4g}, {rr:.4f})" for cc, rr in history))
     del model
     gc.collect()

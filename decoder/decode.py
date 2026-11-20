@@ -6,6 +6,8 @@ zstd frame. Tensor encodings:
   q:   asymmetric group-wise integer quantisation along the last dim. codes uint8 [out, in] (one code per byte; zstd's
        entropy coder does the bit packing), scale bf16 [out, in/group], zero uint8 [out, in/group];
        w = bf16((code - zero) * scale), computed in float32 (bit-identical to the trainer's dequant).
+  u:   uniform (entropy-coded) quantisation per output row. codes int8 [out, in], step float32 [out];
+       w = bf16(code * step[row]), computed in float32.
 Output: top-level *.safetensors with exactly the tensors listed, all bf16. Deterministic: no randomness, no threads
 racing on shared output.
 """
@@ -70,6 +72,16 @@ def dequant(codes: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor, group:
     return result
 
 
+def dequant_u(codes: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+    """codes int8 [out, in], step float32 [out] -> bf16 [out, in]."""
+    out_f, in_f = codes.shape
+    result = torch.empty((out_f, in_f), dtype=torch.bfloat16)
+    rows = max(1, (1 << 24) // in_f)
+    for r in range(0, out_f, rows):
+        result[r : r + rows] = (codes[r : r + rows].float() * step[r : r + rows].unsqueeze(1)).to(torch.bfloat16)
+    return result
+
+
 def decode_tensor(blobs: Blobs, t: dict) -> torch.Tensor:
     shape = t["shape"]
     n = int(np.prod(shape)) if shape else 1
@@ -83,6 +95,11 @@ def decode_tensor(blobs: Blobs, t: dict) -> torch.Tensor:
         scale = bf16_from(blobs.get(t["scale"], 2 * out_f * g), (out_f, g))
         zero = torch.frombuffer(blobs.get(t["zero"], out_f * g), dtype=torch.uint8).view(out_f, g)
         return dequant(codes, scale, zero, group)
+    if t["enc"] == "u":
+        out_f, in_f = shape
+        codes = torch.frombuffer(blobs.get(t["codes"], out_f * in_f), dtype=torch.int8).view(out_f, in_f)
+        step = torch.frombuffer(blobs.get(t["step"], 4 * out_f), dtype=torch.float32)
+        return dequant_u(codes, step)
     raise SystemExit(f"unknown encoding {t['enc']}")
 
 

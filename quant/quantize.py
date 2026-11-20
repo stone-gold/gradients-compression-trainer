@@ -236,11 +236,14 @@ def quantize_model_gptq(
     damp: float = 0.01,
     true_sequential: bool = True,
     time_left=lambda: float("inf"),
+    quantizer=None,
 ) -> dict[str, QResult]:
     """Sequential GPTQ: each layer sees the outputs of the already-quantised layers before it.
 
     The model must sit on one CUDA device. Weights of quantised Linears are replaced in place by their dequantised
     values. Returns {checkpoint weight name: QResult}. Falls back to RTN for the remaining layers if time runs short.
+    quantizer(weight name, weight, H or None) -> result with .dequant(group, dtype) replaces RTN/GPTQ when given (H is
+    None where RTN would be used).
     """
     device = next(model.parameters()).device
     layers = decoder_layers(model)
@@ -299,10 +302,10 @@ def quantize_model_gptq(
             for n in stage:
                 m = remaining.pop(n)
                 if use_rtn or Hs.get(n) is None:
-                    res = rtn(m.weight.data, spec, device=device)
+                    res = rtn(m.weight.data, spec, device=device) if quantizer is None else quantizer(n + ".weight", m.weight.data, None)
                 else:
                     H = Hs[n] * (2.0 / max(1, counts[n]))
-                    res = gptq(m.weight.data, H, spec, damp=damp)
+                    res = gptq(m.weight.data, H, spec, damp=damp) if quantizer is None else quantizer(n + ".weight", m.weight.data, H)
                     Hs[n] = None
                 m.weight.data.copy_(res.dequant(spec.group, m.weight.dtype).to(m.weight.device))
                 results[n + ".weight"] = res

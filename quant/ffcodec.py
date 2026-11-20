@@ -17,6 +17,7 @@ import torch
 import zstandard
 
 from quant import common
+from quant.ecq import UResult
 from quant.quantize import QResult
 
 
@@ -34,6 +35,11 @@ class Entry:
         if self.q is None:
             return {"data": self.tensor.to(torch.bfloat16).contiguous().cpu().view(torch.uint8).numpy().tobytes()}
         q = self.q
+        if isinstance(q, UResult):
+            return {
+                "codes": q.codes.to(torch.int8).contiguous().cpu().numpy().tobytes(),
+                "step": q.step.to(torch.float32).contiguous().cpu().numpy().tobytes(),
+            }
         return {
             "codes": q.codes.to(torch.uint8).contiguous().cpu().numpy().tobytes(),
             "scale": q.scale.to(torch.bfloat16).contiguous().cpu().view(torch.uint8).numpy().tobytes(),
@@ -71,8 +77,8 @@ def encode(entries: list[Entry], level: int = 0, workers: int = 16) -> tuple[lis
     jobs = []
     records = []
     for e in entries:
-        rec = {"name": e.name, "shape": e.shape, "enc": "raw" if e.q is None else "q"}
-        if e.q is not None:
+        rec = {"name": e.name, "shape": e.shape, "enc": "raw" if e.q is None else "u" if isinstance(e.q, UResult) else "q"}
+        if rec["enc"] == "q":
             rec["group"], rec["bits"] = e.group, e.bits
         for key, raw in e.blobs().items():
             rec[key] = len(jobs)
@@ -121,7 +127,7 @@ def write_artifact(out: Path, task_id: str, records: list[dict], frames: list[by
     tensors = []
     for rec in records:
         r = dict(rec)
-        for key in ("data", "codes", "scale", "zero"):
+        for key in ("data", "codes", "scale", "zero", "step"):
             if key in r:
                 r[key] = list(where[r[key]])
         tensors.append(r)
