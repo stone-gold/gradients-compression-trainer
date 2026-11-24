@@ -594,7 +594,8 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     rdo = float(os.environ.get("QUANT_ECQ_RDO", 0.0))
     # L5 dependent quantisation (quant/dq.py, QUANT_ECQ_DQ=1): decoder Linears get a 4-state trellis on the step
     # D = g x (the scalar step), floored at |w|max / max_code so codes stay inside int8; embeddings stay scalar.
-    use_dq = os.environ.get("QUANT_ECQ_DQ", "1") == "1"
+    # off by default (L5 review): the ed1b9a6 path stays the default until the paired GPU runs pass; on with QUANT_ECQ_DQ=1
+    use_dq = os.environ.get("QUANT_ECQ_DQ", "0") == "1"
     dq_g = float(os.environ.get("QUANT_ECQ_DQ_G", 0.6))
     dq_lam = float(os.environ.get("QUANT_ECQ_DQ_LAM", 0.15))  # rate term of the trellis path metric (microtest: -0.5..-1.5% more than 0)
     dq_block = int(os.environ.get("QUANT_ECQ_DQ_BLOCK", 128))

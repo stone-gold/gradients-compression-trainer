@@ -267,6 +267,11 @@ def quantize_model_gptq(
             counts = {n: 0 for n in remaining}
             order: list[str] = []
             first_input: dict[str, int] = {}
+            # the first input of every module stays referenced until the stage is chosen: otherwise the allocator can hand
+            # a freed input's memory to a later module's input (seen on CPU: o_proj's input and the MLP norm output had the
+            # same data_ptr), which put o_proj and gate/up in one "same input" stage, i.e. a run-to-run varying stage split
+            # and, with a group quantizer, one stacked GPTQ on o_proj's Hessian (L5 review)
+            held: list[torch.Tensor] = []
             handles = []
 
             def make_hook(name):
@@ -274,6 +279,7 @@ def quantize_model_gptq(
                     x = inp[0].detach()
                     if name not in first_input:
                         first_input[name] = x.data_ptr()
+                        held.append(x)
                         order.append(name)
                     if use_rtn:
                         return
@@ -298,6 +304,7 @@ def quantize_model_gptq(
             if true_sequential and not use_rtn:
                 ptr = first_input.get(order[0])
                 stage = [n for n in order if first_input.get(n) == ptr]
+                held.clear()
             else:
                 stage = list(remaining)
             if (
