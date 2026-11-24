@@ -450,7 +450,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     log.info("bf16 loss on %d eval rows: %.5f", len(eval_rows), ref_loss)
     n_test = int(os.environ.get("QUANT_FF_TEST_ROWS", 1000))
     sigma_floor = float(os.environ.get("QUANT_FF_SIGMA_FLOOR", 0.0015))
-    bias = float(os.environ.get("QUANT_FF_BIAS", 0.0))
+    bias = float(os.environ.get("QUANT_FF_BIAS", 0.001))  # measured mean of (r_test - r_cal) over 8 local runs: +0.0011 (sd 0.0024)
 
     def measure() -> tuple[float, float]:
         """(calibration r, sigma of the test r around it) for the weights now in the model."""
