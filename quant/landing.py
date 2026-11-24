@@ -25,6 +25,7 @@ from dataclasses import dataclass
 # "nats":  knee = reference + budget nats (QUANT_TARGET knee_loss, or reference_loss + QUANT_FF_NATS_BUDGET), penalty on
 #          the excess in nats. All search arithmetic stays in ratio space: knee_r = knee_loss / reference_loss.
 TARGET_MODE = os.environ.get("QUANT_FF_TARGET_MODE", "ratio")
+CAP_COST = 20.0  # nats charged per unit probability of landing over the cap (exp(20): never worth it)
 
 
 def _phi(z: float) -> float:
@@ -66,10 +67,13 @@ class Target:
         return self.curv * (max(0.0, r - self.knee_r) * self.scale) ** 2
 
     def expected_ln_s(self, nbytes: int, r_pred: float, sigma: float) -> float:
-        """E[ln S] for a candidate whose test r is ~ N(r_pred, sigma^2); inf if the cap is within 4 sigma."""
-        if r_pred + 4.0 * sigma > self.cap_r:
+        """E[ln S] for a candidate whose test r is ~ N(r_pred, sigma^2), plus CAP_COST nats times P(r > cap) (over the
+        cap an entry ranks behind every under-cap one). Never inf below the cap: a noisy estimate must not make every
+        compressed candidate lose to the W8 fallback (t15 with sigma 0.013 did, before this)."""
+        if r_pred > self.cap_r:
             return float("inf")
-        return math.log(max(1, nbytes)) + self.curv * self.scale**2 * expected_sq_excess(r_pred - self.knee_r, sigma)
+        return (math.log(max(1, nbytes)) + self.curv * self.scale**2 * expected_sq_excess(r_pred - self.knee_r, sigma)
+                + CAP_COST * self.p_over(r_pred, sigma, self.cap_r))
 
     def p_over(self, r_pred: float, sigma: float, level: float) -> float:
         """P(test r > level) under the noise model."""

@@ -481,39 +481,43 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # Vocabulary trim (QUANT_FF_VOCAB_TRIM=1): embedding / head rows of tokens that never occur in the task's data are
     # quantised to zero (step far above the row's range): an input row that is never looked up costs nothing, and a zero
     # head row gives that token logit 0 instead of its trained value. Measured on the calibration rows like everything else.
-    trim_mode = os.environ.get("QUANT_FF_VOCAB_TRIM", "mean")  # mean | zero | 0 (off)
-    if trim_mode in ("mean", "zero", "1") and embed_names:
+    # Vocabulary trim (QUANT_FF_VOCAB_TRIM=1): embedding / head rows of tokens that never occur in the task's train split
+    # become the mean of those rows (rarely trained tokens sit near it), on one shared step: identical code rows, stored
+    # contiguously by the row sort, cost ~nothing under LZ, and their logits stay close to the trained ones. Kept only if
+    # its own measured cost at bf16 (all else unquantised) is at most QUANT_FF_TRIM_MAX in r: t15 (small train split, 19k of
+    # 152k ids) paid +0.034, t23 / t05 (49k ids) much less. Calibration rows are NOT added to the used set, so they see
+    # unseen-token misses at the rate the scored rows will.
+    if os.environ.get("QUANT_FF_VOCAB_TRIM", "1") == "1" and embed_names:
         t0 = time.time()
-        # calibration rows are NOT added: they must see unseen-token misses at the rate the scored rows will
         used = used_token_ids(args.task_id, args.dataset, tok, [], float(os.environ.get("QUANT_FF_VOCAB_SECONDS", 240)))
+        plan = {}
         if used:
             for n in embed_names:
                 rows_n = base.shapes[n][0]
                 mask = torch.ones(rows_n, dtype=torch.bool)
                 ids = torch.tensor(sorted(i for i in used if 0 <= i < rows_n), dtype=torch.long)
                 mask[ids] = False
-                if not mask.any() or mask.all():
-                    continue
-                if trim_mode == "mean":
-                    # every unused row becomes the mean of the unused rows (rarely trained tokens sit near it), quantised
-                    # on one shared step: identical code rows, stored contiguously by the row sort, cost ~nothing under LZ;
-                    # their logits stay close to the trained ones instead of jumping to 0
+                if mask.any() and not mask.all() and n in params:
                     w = base.tensor(n)
-                    u = w[mask].float().mean(0).to(w.dtype)
-                    w[mask] = u
-                    if not hasattr(base, "overrides"):
-                        base.overrides = {}
-                    base.overrides[n] = w
-                    if n in params:
-                        params[n].data.copy_(w.to(params[n].dtype).to(params[n].device))
+                    w[mask] = w[mask].float().mean(0).to(w.dtype)
+                    plan[n] = (mask, w)
+        if plan:
+            for n, (mask, w) in plan.items():
+                params[n].data.copy_(w.to(params[n].dtype).to(params[n].device))
+            r_trim, s_trim = measure()
+            keep_trim = r_trim - 1.0 <= float(os.environ.get("QUANT_FF_TRIM_MAX", 0.003))
+            log.info("vocab trim: %d token ids used, %s rows trimmed; bf16 + trim r %.4f (sigma %.4f): %s (%.0fs)", len(used),
+                     ",".join(str(int(m.sum())) for m, _ in plan.values()), r_trim, s_trim, "kept" if keep_trim else "REJECTED", time.time() - t0)
+            if keep_trim:
+                base.overrides = {n: w for n, (mask, w) in plan.items()}
+                for n, (mask, w) in plan.items():
                     shared = alloc.base[n][~mask].median()
                     alloc.base[n] = torch.where(mask, shared.expand_as(alloc.base[n]), alloc.base[n])
                     if n in alloc.floor:
                         alloc.floor[n] = torch.where(mask, alloc.floor[n][mask].max().expand_as(alloc.floor[n]), alloc.floor[n])
-                else:
-                    alloc.base[n] = torch.where(mask, torch.full_like(alloc.base[n], 1e30), alloc.base[n])
-                    alloc.floor.setdefault(n, torch.zeros(rows_n))
-                log.info("vocab trim (%s) %s: %d of %d token ids used; %d rows trimmed (%.0fs)", trim_mode, n, len(used), rows_n, int(mask.sum()), time.time() - t0)
+            else:
+                for n in plan:
+                    params[n].data.copy_(base.tensor(n).to(params[n].dtype).to(params[n].device))
 
     aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.001))
     size_pts: list[tuple[float, int]] = []  # (r, bytes) of encoded candidates: slope of ln bytes in r
