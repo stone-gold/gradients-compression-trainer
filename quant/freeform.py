@@ -272,6 +272,33 @@ def used_token_ids(task_id: str, dataset_arg: str, tok, extra_rows, time_limit: 
     return used
 
 
+def final_rans(args, out, best: dict, deadline, level: int, base) -> None:
+    """Lossless last step (QUANT_FF_RANS=1, default): re-code the shipped candidate's codes with row-class context rANS
+    (quant/rans.py; t23: -3.3% on the linears' codes, embeddings keep zstd where LZ wins), verify with the real decoder on
+    a sample of tensors, else put the zstd generation back. The weights, and so r, are unchanged."""
+    entries = best.get("entries")
+    if os.environ.get("QUANT_FF_RANS", "1") != "1" or not entries or str(best.get("name")).startswith("rtn-"):
+        return
+    n_codes = sum(math.prod(e.shape) for e in entries if e.q is not None)
+    need = n_codes / float(os.environ.get("QUANT_FF_RANS_RATE", 2e7)) + 120
+    if deadline.left() < need + 120:
+        log.info("rANS: skipped (%.0fs left, needs ~%.0fs)", deadline.left(), need)
+        return
+    t0 = time.time()
+    old_bytes = best["bytes"]
+    try:
+        records, frames = ffcodec.encode(entries, level=level, use_rans=True)
+        info = dict(best.get("info") or {}, coder="rans")
+        total = ffcodec.write_artifact(out, args.task_id, records, frames, info)
+        verify_roundtrip(out, entries, sample=int(os.environ.get("QUANT_FF_RANS_VERIFY", 32)))
+        best["bytes"] = total
+        log.info("rANS: %d -> %d bytes (%+.2f%%) in %.0fs", old_bytes, total, 100.0 * (total / old_bytes - 1), time.time() - t0)
+    except Exception as exc:  # noqa: BLE001 - the zstd generation goes back in place
+        log.warning("rANS stage failed (%s): restoring the zstd artifact", exc)
+        records, frames = ffcodec.encode(entries, level=level)
+        best["bytes"] = ffcodec.write_artifact(out, args.task_id, records, frames, best.get("info"))
+
+
 def run(args) -> None:
     deadline = common.Deadline.from_hours(args.hours_to_complete)
     target = freeform_target()
@@ -306,7 +333,7 @@ def run(args) -> None:
             if (force or score < best["score"]) and deadline.left() > 60:
                 info = {"candidate": name, "predicted_r": r_pred, "sigma": sg}
                 total = ffcodec.write_artifact(out, args.task_id, records, frames, info)
-                best.update(S=S, score=score, name=name, r=r_pred, bytes=total)
+                best.update(S=S, score=score, name=name, r=r_pred, bytes=total, entries=entries, info=info)
                 if os.environ.get("QUANT_FF_VERIFY", "1") == "1" and entries is not None:
                     verify_roundtrip(out, entries, sample=None if base.bf16_bytes() < 4e9 else 24)
             return records, frames, est
@@ -341,6 +368,7 @@ def run(args) -> None:
 
     if os.environ.get("QUANT_FF_MODE", "ecq") == "ecq":
         run_ecq(args, deadline, target, base, names_2d, consider, best, margin, device, src, tgt if land == "expected" else None)
+        final_rans(args, out, best, deadline, level, base)
         log.info("final: %s, %s bytes, predicted r %s, predicted S %.1f MB, %.0fs elapsed", best["name"], best["bytes"], best["r"], best["S"] / 1e6, deadline.elapsed())
         return
 
@@ -853,7 +881,10 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             parts = [(src_of[name] if name in src_of else lo)["enc"][name] for name in base.shapes]
             enc = join_encoded(parts)
             mname = f"ecq-mix-c{lo['c']:.4g}-c{hi['c']:.4g}-m{m}of{len(units)}"
-            _, _, est = consider(mname, None, r + bias, sigma=sigma, enc=enc)
+            mix_entries = [ffcodec.Entry(name, shape, q=src_of[name]["lin"][name]) if name in src_of else ffcodec.Entry(name, shape, tensor=base.tensor(name))
+                           for name, shape in base.shapes.items()]
+            _, _, est = consider(mname, mix_entries, r + bias, sigma=sigma, enc=enc)
+            del mix_entries
             sc = tgt.expected_ln_s(est, 1.0 + (r - 1.0) * (1.0 - tune_f) + bias, sigma)
             if final is None or sc < final["score"]:
                 final = {"lin": {n: src_of[n]["lin"][n] for n in names_2d}, "r": r, "name": mname, "score": sc}

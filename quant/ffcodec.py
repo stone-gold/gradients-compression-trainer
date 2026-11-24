@@ -89,20 +89,42 @@ def _compress(raw: bytes, level: int, codes: bool, lz_try: bool = False) -> byte
     return out
 
 
-def encode(entries: list[Entry], level: int = 0, workers: int = 16) -> tuple[list[dict], list[bytes]]:
-    """-> (tensor records with blob refs into the frame list, frames). Refs are (frame index) until laid out."""
+def encode(entries: list[Entry], level: int = 0, workers: int = 16, use_rans: bool = False) -> tuple[list[dict], list[bytes]]:
+    """-> (tensor records with blob refs into the frame list, frames). Refs are (frame index) until laid out.
+    use_rans: the codes of every "u" tensor with row keys are also coded with quant/rans.py (row-class context rANS);
+    the smaller of the two is kept ("codes_rans" = raw rANS blob instead of the zstd "codes" frame)."""
     jobs = []
     records = []
     for e in entries:
         rec = {"name": e.name, "shape": e.shape, "enc": "raw" if e.q is None else "u" if isinstance(e.q, UResult) else "q"}
         if rec["enc"] == "q":
             rec["group"], rec["bits"] = e.group, e.bits
-        for key, raw in e.blobs().items():
+        blobs = e.blobs()
+        rans_src = None
+        if use_rans and rec["enc"] == "u" and "rowkey" in blobs:
+            R, C = e.shape
+            key = np.frombuffer(blobs["rowkey"], dtype=np.uint8)
+            rans_src = (np.frombuffer(blobs["codes"], dtype=np.int8).reshape(R, C), np.sort(key, kind="stable"))
+        for key, raw in blobs.items():
             rec[key] = len(jobs)
-            jobs.append((raw, key == "codes", len(e.shape) == 2 and e.shape[0] >= 32000))
+            jobs.append((raw, key == "codes", len(e.shape) == 2 and e.shape[0] >= 32000, rans_src if key == "codes" else None))
         records.append(rec)
+
+    def work(job):
+        frame = _compress(job[0], level, job[1], job[2])
+        if job[3] is None:
+            return frame, False
+        from quant import rans
+
+        blob = rans.encode(*job[3])
+        return (blob, True) if len(blob) < len(frame) else (frame, False)
+
     with ThreadPoolExecutor(workers) as ex:
-        frames = list(ex.map(lambda job: _compress(job[0], level, job[1], job[2]), jobs))
+        done = list(ex.map(work, jobs))
+    frames = [f for f, _ in done]
+    for rec in records:
+        if "codes" in rec and done[rec["codes"]][1]:
+            rec["codes_rans"] = rec.pop("codes")
     return records, frames
 
 
@@ -144,7 +166,7 @@ def write_artifact(out: Path, task_id: str, records: list[dict], frames: list[by
     tensors = []
     for rec in records:
         r = dict(rec)
-        for key in ("data", "codes", "scale", "zero", "step", "rowkey", "col"):
+        for key in ("data", "codes", "codes_rans", "scale", "zero", "step", "rowkey", "col"):
             if key in r:
                 r[key] = list(where[r[key]])
         tensors.append(r)
