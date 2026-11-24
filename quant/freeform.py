@@ -709,11 +709,12 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         c = nb if nb is not None else next_gptq_c(history, rtn_hist, aim, c, r)
 
     # Layer mix (landing mode): with a probe under the aim (lo) and one over it (hi), take the first m mixing units
-    # (decoder blocks, embeddings first) from hi and the rest from lo. r and bytes move in ~1/units steps between the two
+    # (decoder blocks, embeddings last) from hi and the rest from lo. r and bytes move in ~1/units steps between the two
     # probes, so the landing gets much finer than a GPTQ probe can be placed, at the cost of one eval pass per step.
     if tgt is not None and "lo" in keep and "hi" in keep and deadline.left() > 240:
         lo, hi = keep["lo"], keep["hi"]
-        units = sorted({unit_of(n) for n in names_2d})
+        # decoder blocks first, embeddings / head last: on t15 the tied embedding alone moved r +0.0045 for 4 MB
+        units = sorted(u for u in {unit_of(n) for n in names_2d} if u >= 0) + ([-1] if any(unit_of(n) < 0 for n in names_2d) else [])
         m_lo, r_lo, m_hi, r_hi = 0, lo["r"], len(units), hi["r"]
         tol_mix = float(os.environ.get("QUANT_FF_MIX_TOL", 0.0008))
         eval_time = None
