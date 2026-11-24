@@ -33,6 +33,10 @@ class UResult:
     codes: torch.Tensor  # int8 [out, in]
     step: torch.Tensor  # fp32 [out]
     col: torch.Tensor | None = None  # fp32 [in] or None: grid of weight (i, j) is step[i] * col[j]
+    dq: bool = False  # codes are a 4-state trellis path (quant/dq.py); dequantisation is the same
+    perm: torch.Tensor | None = None  # dq only: column order of the trellis (int64 [in]); None = natural order
+    okey: torch.Tensor | None = None  # dq only: uint8 [in] bucket key with perm = stable argsort(okey), or None
+    chunk: int = 0  # dq only: trellis restart period in columns (trellis order); 0 = once per row
 
     def grid(self) -> torch.Tensor:
         s = self.step.float().unsqueeze(1).to(self.codes.device)

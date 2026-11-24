@@ -92,7 +92,10 @@ def _compress(raw: bytes, level: int, codes: bool, lz_try: bool = False) -> byte
 def encode(entries: list[Entry], level: int = 0, workers: int = 16, use_rans: bool = False) -> tuple[list[dict], list[bytes]]:
     """-> (tensor records with blob refs into the frame list, frames). Refs are (frame index) until laid out.
     use_rans: the codes of every "u" tensor with row keys are also coded with quant/rans.py (row-class context rANS);
-    the smaller of the two is kept ("codes_rans" = raw rANS blob instead of the zstd "codes" frame)."""
+    the smaller of the two is kept ("codes_rans" = raw rANS blob instead of the zstd "codes" frame). A tensor whose codes
+    are a 4-state trellis path (UResult.dq, quant/dq.py) is also coded with rans.encode_dq ("codes_dq", natural row
+    order), unless QUANT_FF_DQ_CODER=0; the smallest of the three is kept."""
+    dq_coder = os.environ.get("QUANT_FF_DQ_CODER", "1") == "1"
     jobs = []
     records = []
     for e in entries:
@@ -104,7 +107,12 @@ def encode(entries: list[Entry], level: int = 0, workers: int = 16, use_rans: bo
         if use_rans and rec["enc"] == "u" and "rowkey" in blobs:
             R, C = e.shape
             key = np.frombuffer(blobs["rowkey"], dtype=np.uint8)
-            rans_src = (np.frombuffer(blobs["codes"], dtype=np.int8).reshape(R, C), np.sort(key, kind="stable"))
+            dq_src = None
+            if dq_coder and getattr(e.q, "dq", False) and R * C > 0:
+                perm = None if e.q.perm is None else e.q.perm.cpu().numpy().astype(np.int64)
+                okey = None if getattr(e.q, "okey", None) is None else e.q.okey.cpu().numpy().astype(np.uint8)
+                dq_src = (e.q.codes.to(torch.int8).contiguous().cpu().numpy(), perm, key, None, okey, int(getattr(e.q, "chunk", 0) or 0))
+            rans_src = (np.frombuffer(blobs["codes"], dtype=np.int8).reshape(R, C), np.sort(key, kind="stable"), dq_src)
         for key, raw in blobs.items():
             rec[key] = len(jobs)
             jobs.append((raw, key == "codes", len(e.shape) == 2 and e.shape[0] >= 32000, rans_src if key == "codes" else None))
@@ -113,18 +121,29 @@ def encode(entries: list[Entry], level: int = 0, workers: int = 16, use_rans: bo
     def work(job):
         frame = _compress(job[0], level, job[1], job[2])
         if job[3] is None:
-            return frame, False
+            return frame, None
         from quant import rans
 
-        blob = rans.encode(*job[3])
-        return (blob, True) if len(blob) < len(frame) else (frame, False)
+        best, tag = frame, None
+        if job[3][2] is not None:
+            try:
+                blob = rans.encode_dq(*job[3][2])
+                if len(blob) < len(best):
+                    return blob, "codes_dq"
+            except ValueError:  # not a trellis path (e.g. codes replaced after the search): static coders only
+                pass
+        blob = rans.encode(job[3][0], job[3][1])
+        if len(blob) < len(best):
+            best, tag = blob, "codes_rans"
+        return best, tag
 
     with ThreadPoolExecutor(workers) as ex:
         done = list(ex.map(work, jobs))
     frames = [f for f, _ in done]
     for rec in records:
-        if "codes" in rec and done[rec["codes"]][1]:
-            rec["codes_rans"] = rec.pop("codes")
+        if "codes" in rec and done[rec["codes"]][1] is not None:
+            tag = done[rec["codes"]][1]
+            rec[tag] = rec.pop("codes")
     return records, frames
 
 
@@ -166,7 +185,7 @@ def write_artifact(out: Path, task_id: str, records: list[dict], frames: list[by
     tensors = []
     for rec in records:
         r = dict(rec)
-        for key in ("data", "codes", "codes_rans", "scale", "zero", "step", "rowkey", "col"):
+        for key in ("data", "codes", "codes_rans", "codes_dq", "scale", "zero", "step", "rowkey", "col"):
             if key in r:
                 r[key] = list(where[r[key]])
         tensors.append(r)

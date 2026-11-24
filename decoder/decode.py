@@ -10,6 +10,8 @@ zstd frame. Tensor encodings:
        w = bf16(code * step[row]), computed in float32. Optional rowkey uint8 [out]: the codes blob holds the rows in
        np.argsort(rowkey, kind="stable") order. Optional col float32 [in]: w = bf16(code * (step[row] * col[column])).
   codes_rans (instead of codes): the same int8 codes coded with static row-class-context rANS (see rans_decode).
+  codes_dq (instead of codes): codes of a 4-state dependent quantisation (trellis) path, natural row order, coded with
+       rANS given (row class, trellis state) (see dq_decode); rowkey then only gives the row classes.
 Output: top-level *.safetensors with exactly the tensors listed, all bf16. Deterministic: no randomness, no threads
 racing on shared output (the rANS stage runs in a process pool over tensors; results are consumed in manifest order).
 """
@@ -149,6 +151,118 @@ def rans_decode(blob: bytes, rows: int, cols: int, key_sorted: np.ndarray) -> np
     return (out[:n] - 128).astype(np.int8).reshape(rows, cols)
 
 
+DQ_MAGIC = 0x34515144
+DQ_NEXT = np.array([[0, 2], [2, 0], [1, 3], [3, 1]], dtype=np.int64)
+
+
+def dq_decode(blob: bytes, rows: int, cols: int, key: np.ndarray) -> np.ndarray:
+    """Inverse of quant/rans.py encode_dq: 4-state dependent quantisation (VVC-style trellis-coded quantisation;
+    Schwarz et al., DCC 2019) coded with static rANS (Duda 2013). Codes in trellis column order (perm), rows in
+    natural order, flattened row-major; the state restarts at 0 every CH codes, and each of the L lanes holds m whole
+    CH-chunks; all lanes are decoded in lock step. States 0, 1 use quantiser Q0 (n = 2k), states 2, 3 use Q1
+    (n = 2k - sgn k); next state = DQ_NEXT[state][k & 1]. Context = (row class, state), or (row class, state >> 1)
+    when flag bit 2 is set. Per (context, slot) the decoded symbol's frequency, slot offset, output code and next
+    state are tabulated once, so a step is a few table lookups. Integer numpy only (deterministic).
+    key: uint8 [rows] row keys in natural order. Returns int8 codes n [rows, cols] in natural order."""
+    pb, low = 12, 1 << 16
+    magic, R, C, ncls, flags, m, tlen, ch = (int(v) for v in np.frombuffer(blob, dtype=np.int32, count=8))
+    if magic != DQ_MAGIC or R != rows or C != cols or m < 1 or ch < 1 or C % ch:
+        raise SystemExit("dq blob header mismatch")
+    pos = 32
+    perm = None
+    if flags & 8:  # bucket order key, 4-bit nibbles: trellis column order = stable argsort of the key
+        nb = (C + 1) // 2
+        b = np.frombuffer(blob, dtype=np.uint8, count=nb, offset=pos)
+        okey = np.empty(2 * nb, dtype=np.uint8)
+        okey[0::2], okey[1::2] = b & 15, b >> 4
+        perm = np.argsort(okey[:C], kind="stable").astype(np.int64)
+        pos += nb
+    elif flags & 1:
+        pdt = np.uint32 if flags & 2 else np.uint16
+        perm = np.frombuffer(blob, dtype=pdt, count=C, offset=pos).astype(np.int64)
+        pos += C * np.dtype(pdt).itemsize
+        if not np.array_equal(np.sort(perm), np.arange(C)):
+            raise SystemExit("dq column order is not a permutation")
+    ns = 2 if flags & 4 else 4
+    tab = zstandard.ZstdDecompressor().decompress(blob[pos : pos + tlen], max_output_size=ncls * ns * 520)
+    pos += tlen
+    nctx = ncls * ns
+    freq = np.zeros((nctx, 256), dtype=np.int64)
+    tp = 0
+    for c in range(nctx):
+        smin, nsym = (int(v) for v in np.frombuffer(tab, dtype=np.int16, count=2, offset=tp))
+        tp += 4
+        freq[c, smin : smin + nsym] = np.frombuffer(tab, dtype=np.uint16, count=nsym, offset=tp)
+        tp += 2 * nsym
+    if tp != len(tab):
+        raise SystemExit("dq table size mismatch")
+    cum = np.zeros((nctx, 257), dtype=np.int64)
+    cum[:, 1:] = np.cumsum(freq, axis=1)
+    if not np.all((cum[:, 256] == 1 << pb) | (cum[:, 256] == 0)):
+        raise SystemExit("dq rANS table does not sum to 4096")
+    # per (context, slot): frequency and (slot - cumulative) of the symbol, its output code and the next state
+    nslot = 1 << pb
+    fs = np.zeros((nctx, nslot), dtype=np.uint64)
+    bs = np.zeros((nctx, nslot), dtype=np.uint64)
+    nout = np.zeros((nctx, nslot), dtype=np.int8)
+    par = np.zeros((nctx, nslot), dtype=np.int64)
+    slots = np.arange(nslot, dtype=np.int64)
+    for c in range(nctx):
+        if not cum[c, 256]:
+            continue
+        sym = np.repeat(np.arange(256), freq[c])
+        k = sym - 128
+        q = ((c % ns) >> 1) if ns == 4 else (c % ns)
+        fs[c] = freq[c, sym].astype(np.uint64)
+        bs[c] = (slots - cum[c, sym]).astype(np.uint64)
+        nout[c] = (2 * k - q * np.sign(k)).astype(np.int8)
+        par[c] = k & 1
+    fs, bs, nout, par = fs.reshape(-1), bs.reshape(-1), nout.reshape(-1), par.reshape(-1)
+    _, rcls = np.unique(key, return_inverse=True)
+    rcls = rcls.astype(np.int64).reshape(-1)
+    if int(rcls.max(initial=0)) + 1 != ncls:
+        raise SystemExit("dq class count mismatch")
+    seg = m * ch
+    n = R * C
+    lanes = -(-n // seg)
+    x = np.frombuffer(blob, dtype=np.uint32, count=lanes, offset=pos).astype(np.uint64)
+    pos += 4 * lanes
+    words = np.frombuffer(blob, dtype=np.uint16, offset=pos).astype(np.uint64)
+    ptr = 0
+    clsb = np.zeros((lanes * seg) // C + 1, dtype=np.int64)
+    clsb[:R] = rcls * (ns * nslot)  # flat table offset of each row's first context
+    out = np.zeros((lanes, seg), dtype=np.int8)
+    base = np.arange(lanes, dtype=np.int64) * seg
+    partial = n % seg != 0
+    valid = None
+    st = np.zeros(lanes, dtype=np.int64)
+    sh = 0 if ns == 4 else 1
+    mask_slot, s_pb, s16, lowv = np.uint64(nslot - 1), np.uint64(pb), np.uint64(16), np.uint64(low)
+    for i in range(seg):
+        if i % ch == 0:
+            st[:] = 0  # a chunk starts in every lane
+        pos_i = base + i
+        if partial:
+            valid = pos_i < n
+        fi = clsb[pos_i // C] + ((st >> sh) << pb) + (x & mask_slot).astype(np.int64)
+        xn = fs[fi] * (x >> s_pb) + bs[fi]
+        x = np.where(valid, xn, x) if partial else xn
+        need = np.nonzero((x < lowv) & valid if partial else x < lowv)[0]
+        if len(need):
+            x[need] = (x[need] << s16) | words[ptr : ptr + len(need)]
+            ptr += len(need)
+        out[:, i] = nout[fi]
+        st = DQ_NEXT[st, par[fi]]
+    if ptr != len(words):
+        raise SystemExit("dq stream not fully consumed")
+    out = out.reshape(-1)[:n].reshape(R, C)
+    if perm is None:
+        return out
+    nat = np.empty_like(out)
+    nat[:, perm] = out
+    return nat
+
+
 def decode_tensor(blobs: Blobs, t: dict, rans_codes: np.ndarray | None = None) -> torch.Tensor:
     shape = t["shape"]
     n = int(np.prod(shape)) if shape else 1
@@ -165,7 +279,12 @@ def decode_tensor(blobs: Blobs, t: dict, rans_codes: np.ndarray | None = None) -
     if t["enc"] == "u":
         out_f, in_f = shape
         key = np.frombuffer(bytes(blobs.get(t["rowkey"], out_f)), dtype=np.uint8) if "rowkey" in t else None
-        if "codes_rans" in t:  # rANS-coded codes (stored row order; contexts from the row keys)
+        if "codes_dq" in t:  # trellis (dependent quantisation) codes, natural row order; contexts from the row keys
+            if rans_codes is None:
+                rans_codes = dq_decode(blobs.raw(t["codes_dq"]), out_f, in_f, key)
+            codes = torch.from_numpy(rans_codes)
+            key = None  # natural order already
+        elif "codes_rans" in t:  # rANS-coded codes (stored row order; contexts from the row keys)
             sorted_key = np.sort(key, kind="stable") if key is not None else np.zeros(out_f, dtype=np.uint8)
             if rans_codes is None:
                 rans_codes = rans_decode(blobs.raw(t["codes_rans"]), out_f, in_f, sorted_key)
@@ -190,6 +309,8 @@ def _rans_codes(t: dict) -> np.ndarray:
     """Worker: rANS-decode one tensor's codes (numpy only; no torch in forked workers)."""
     out_f, in_f = t["shape"]
     key = np.frombuffer(bytes(_BLOBS.get(t["rowkey"], out_f)), dtype=np.uint8)
+    if "codes_dq" in t:
+        return dq_decode(_BLOBS.raw(t["codes_dq"]), out_f, in_f, key)
     return rans_decode(_BLOBS.raw(t["codes_rans"]), out_f, in_f, np.sort(key, kind="stable"))
 
 
@@ -202,7 +323,7 @@ def decoded_tensors(blobs: Blobs, tensors: list[dict]):
         ncpu = len(os.sched_getaffinity(0))
     except AttributeError:
         ncpu = os.cpu_count() or 1
-    coded = [t for t in tensors if "codes_rans" in t and "rowkey" in t]
+    coded = [t for t in tensors if ("codes_rans" in t or "codes_dq" in t) and "rowkey" in t]
     if ncpu > 1 and coded:
         import multiprocessing
 

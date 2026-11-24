@@ -24,6 +24,7 @@ import torch
 from safetensors import safe_open
 
 from quant import common
+from quant import dq
 from quant import ecq
 from quant import ffcodec
 from quant import landing
@@ -281,7 +282,10 @@ def final_rans(args, out, best: dict, deadline, level: int, base) -> None:
         return
     n_codes = sum(math.prod(e.shape) for e in entries if e.q is not None)
     need = n_codes / float(os.environ.get("QUANT_FF_RANS_RATE", 2e7)) + 120
-    if deadline.left() < need + 120:
+    # trellis codes in plain zstd frames cost ~+34% (t23 layer 13): their state-aware coding is not optional, so it
+    # runs whenever there is any time left (run_ecq reserves its time when DQ is on)
+    has_dq = any(getattr(e.q, "dq", False) for e in entries if e.q is not None)
+    if deadline.left() < (60 if has_dq else need + 120):
         log.info("rANS: skipped (%.0fs left, needs ~%.0fs)", deadline.left(), need)
         return
     t0 = time.time()
@@ -582,6 +586,37 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     col_clamp = float(os.environ.get("QUANT_ECQ_COL_CLAMP", 4.0))
     max_code = float(os.environ.get("QUANT_ECQ_MAX_CODE", 100))
     rdo = float(os.environ.get("QUANT_ECQ_RDO", 0.0))
+    # L5 dependent quantisation (quant/dq.py, QUANT_ECQ_DQ=1): decoder Linears get a 4-state trellis on the step
+    # D = g x (the scalar step), floored at |w|max / max_code so codes stay inside int8; embeddings stay scalar.
+    use_dq = os.environ.get("QUANT_ECQ_DQ", "1") == "1"
+    dq_g = float(os.environ.get("QUANT_ECQ_DQ_G", 0.6))
+    dq_lam = float(os.environ.get("QUANT_ECQ_DQ_LAM", 0.15))  # rate term of the trellis path metric (microtest: -0.5..-1.5% more than 0)
+    dq_block = int(os.environ.get("QUANT_ECQ_DQ_BLOCK", 128))
+    dq_rate_cols = int(os.environ.get("QUANT_ECQ_DQ_RATE_COLS", 512))  # rate tables from the first columns only (time)
+    # trellis column order: "b16" = act order in 16 buckets (4 bits per column in the artifact; microtest: better than
+    # the exact act order once its permutation bytes count), "act" = exact act order, "nat" = natural order
+    dq_order = {"b16": "b16", "act": True, "nat": False}[os.environ.get("QUANT_ECQ_DQ_ORDER", "b16")]
+    if os.environ.get("QUANT_ECQ_ACT_ORDER", "1") != "1":
+        dq_order = False
+    # time kept free for the final state-aware coding of trellis codes (final_rans): codes / rate + verify
+    dq_reserve = (sum(math.prod(base.shapes[n]) for n in names_2d) / float(os.environ.get("QUANT_FF_DQ_RATE", 8e6)) + 60) if use_dq else 0.0
+    if use_dq:
+        log.info("ECQ: dependent quantisation on (g %.3f, lambda %.3f, block %d), final coding reserve %.0fs", dq_g, dq_lam, dq_block, dq_reserve)
+
+    def dq_step(w, st, col=None):
+        d = st.float().cpu() * dq_g
+        a = w.float().abs()
+        if col is not None:
+            a = a / col.to(a.device).unsqueeze(0)
+        return torch.maximum(d, (a.amax(1) / max_code).cpu())
+
+    def rtn_lin(n, w, st):
+        """RTN-level quantiser of a 2-D weight. Scalar by default even with DQ on: at D = g x step (g 0.6) the GPTQ
+        trellis lands at about the scalar GPTQ error (microtest), so the scalar RTN bracket still places the GPTQ probes,
+        at none of the trellis cost. QUANT_ECQ_DQ_RTN=1: trellis without error feedback."""
+        if use_dq and os.environ.get("QUANT_ECQ_DQ_RTN", "0") == "1" and not is_embed_like(n):
+            return dq.rtn_dq(w, dq_step(w, st), device=device)
+        return ecq.rtn_u(w, st, device=device)
     history: list[tuple[float, float]] = []
     max_probes = int(os.environ.get("QUANT_ECQ_PROBES", 5))
     tol = float(os.environ.get("QUANT_ECQ_TOL", 0.0015))
@@ -713,7 +748,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         t0 = time.time()
         restore()
         steps = alloc.steps(c)
-        res = {n: ecq.rtn_u(params[n].data, steps[n], device=device) for n in names_2d if n in params}
+        res = {n: rtn_lin(n, params[n].data, steps[n]) for n in names_2d if n in params}
         set_weights(model, res, 0)
         del res
         with torch.no_grad():
@@ -770,7 +805,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     for k in range(max_probes):
         # GPTQ itself switches to RTN when less than ~1.2 x its time is left beyond a 300 s margin: never start a probe
         # that would degrade that way (it costs time and lands nowhere useful)
-        if probe_time is not None and deadline.left() < probe_time * float(os.environ.get("QUANT_ECQ_GATE_MULT", 1.15)) + 330:
+        if probe_time is not None and deadline.left() < probe_time * float(os.environ.get("QUANT_ECQ_GATE_MULT", 1.15)) + 330 + dq_reserve:
             log.info("ECQ: no time for another probe (%.0fs left, probe %.0fs)", deadline.left(), probe_time)
             break
         t0 = time.time()
@@ -779,16 +814,40 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
 
         def quantizer(name, w, H):
             if H is None:
-                return ecq.rtn_u(w, steps[name], device=device)
+                return rtn_lin(name, w, steps[name])
             col, st = None, steps[name]
             if col_alpha > 0:
                 col = ecq.column_factors(H, col_alpha, col_clamp)
                 st = ecq.floor_step(w, st, col, max_code)
-            return ecq.gptq_u(w, H, st, damp=damp, act_order=os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1", col=col, rdo=rdo)
+            act = os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1"
+            if use_dq and not is_embed_like(name):
+                d = dq_step(w, st, col)
+                kw = {}
+                if dq_lam > 0:  # rate model: per (row class, state) tables of the trellis RTN codes on the same grid
+                    bits, cls = dq.rate_tables(dq.rtn_dq(w[:, :dq_rate_cols], d, device=H.device).codes, None)
+                    kw = {"lam": dq_lam, "bits": bits, "cls": cls}
+                return dq.gptq_dq(w, H, d, damp=damp, blocksize=dq_block, act_order=dq_order if act else False, col=col, **kw)
+            return ecq.gptq_u(w, H, st, damp=damp, act_order=act, col=col, rdo=rdo)
 
         def group_quantizer(names, ws, H):
             # stacked rows of linears sharing an input; per-row steps make the stack exact (no column factors here)
-            if col_alpha > 0:
+            if use_dq and col_alpha <= 0 and not any(is_embed_like(n) for n in names):
+                # one trellis search over the stacked rows (GPTQ is row-separable: same result as one call per tensor,
+                # with a third / half of the per-column steps for q/k/v and gate/up)
+                sizes = [w.shape[0] for w in ws]
+                wcat = torch.cat(ws, 0)
+                d = torch.cat([dq_step(w, steps[n]) for n, w in zip(names, ws)])
+                kw = {}
+                if dq_lam > 0:
+                    bits, cls = dq.rate_tables(dq.rtn_dq(wcat[:, :dq_rate_cols], d, device=H.device).codes, None)
+                    kw = {"lam": dq_lam, "bits": bits, "cls": cls}
+                u = dq.gptq_dq(wcat, H, d, damp=damp, blocksize=dq_block, act_order=dq_order, **kw)
+                out, r0 = [], 0
+                for sz in sizes:
+                    out.append(ecq.UResult(u.codes[r0 : r0 + sz].contiguous(), u.step[r0 : r0 + sz].contiguous(), dq=True, perm=u.perm, okey=u.okey, chunk=u.chunk))
+                    r0 += sz
+                return out
+            if col_alpha > 0 or use_dq:
                 return [quantizer(n, w, H) for n, w in zip(names, ws)]
             sizes = [w.shape[0] for w in ws]
             u = ecq.gptq_u(torch.cat(ws, 0), H, torch.cat([steps[n] for n in names]), damp=damp,
@@ -801,7 +860,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
 
         lin = quantize_model_gptq(
             model, samples, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300, quantizer=quantizer,
-            group_quantizer=group_quantizer if os.environ.get("QUANT_ECQ_GROUP_GPTQ", "0") == "1" else None,
+            group_quantizer=group_quantizer if (use_dq or os.environ.get("QUANT_ECQ_GROUP_GPTQ", "0") == "1") else None,
         )
         lin = {n: q for n, q in lin.items() if n in base.shapes and not is_embed_like(n)}
         for n in names_2d:
@@ -860,7 +919,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # Layer mix (landing mode): with a probe under the aim (lo) and one over it (hi), take the first m mixing units
     # (decoder blocks, embeddings last) from hi and the rest from lo. r and bytes move in ~1/units steps between the two
     # probes, so the landing gets much finer than a GPTQ probe can be placed, at the cost of one eval pass per step.
-    if tgt is not None and "lo" in keep and "hi" in keep and deadline.left() > 240:
+    if tgt is not None and "lo" in keep and "hi" in keep and deadline.left() > 240 + dq_reserve:
         lo, hi = keep["lo"], keep["hi"]
         # decoder blocks first, embeddings / head last: on t15 the tied embedding alone moved r +0.0045 for 4 MB
         units = sorted(u for u in {unit_of(n) for n in names_2d} if u >= 0) + ([-1] if any(unit_of(n) < 0 for n in names_2d) else [])
@@ -868,7 +927,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         tol_mix = float(os.environ.get("QUANT_FF_MIX_TOL", 0.0008))
         eval_time = None
         for j in range(int(os.environ.get("QUANT_FF_MIX_EVALS", 5))):
-            if m_hi - m_lo <= 1 or (eval_time is not None and deadline.left() < eval_time * 2 + 180) or deadline.left() < 240:
+            if m_hi - m_lo <= 1 or (eval_time is not None and deadline.left() < eval_time * 2 + 180 + dq_reserve) or deadline.left() < 240 + dq_reserve:
                 break
             t0 = time.time()
             frac = (aim - r_lo) / max(1e-9, r_hi - r_lo)
