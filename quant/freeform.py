@@ -505,7 +505,15 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             for n, (mask, w) in plan.items():
                 params[n].data.copy_(w.to(params[n].dtype).to(params[n].device))
             r_trim, s_trim = measure()
-            keep_trim = r_trim - 1.0 <= float(os.environ.get("QUANT_FF_TRIM_MAX", 0.003))
+            # keep when the bytes it frees beat what its loss costs at the landing: freed share ~ trimmed embedding weights /
+            # all 2-D weights x 0.8 (embeddings code at ~0.8x the mean rate), cost = k x (r_trim - 1), k = QUANT_FF_TRIM_K
+            # (d ln bytes / dr near the knee, measured 3.6-11.5). t05: 0.17 vs 0.029 keep (measured S -8%); t23 0.10 vs 0.08
+            # keep (measured neutral); t15 0.13 vs 0.23 reject (measured +0.034 r).
+            n_all = sum(math.prod(base.shapes[n]) for n in names_2d)
+            freed = 0.8 * sum(int(m.sum()) * base.shapes[n][1] for n, (m, _) in plan.items()) / max(1, n_all)
+            cost = float(os.environ.get("QUANT_FF_TRIM_K", 8.0)) * max(0.0, r_trim - 1.0)
+            keep_trim = freed > cost and r_trim - 1.0 <= float(os.environ.get("QUANT_FF_TRIM_MAX", 0.02))
+            log.info("vocab trim: frees ~%.3f of the bytes, costs ~%.3f at the landing", freed, cost)
             log.info("vocab trim: %d token ids used, %s rows trimmed; bf16 + trim r %.4f (sigma %.4f): %s (%.0fs)", len(used),
                      ",".join(str(int(m.sum())) for m, _ in plan.values()), r_trim, s_trim, "kept" if keep_trim else "REJECTED", time.time() - t0)
             if keep_trim:
