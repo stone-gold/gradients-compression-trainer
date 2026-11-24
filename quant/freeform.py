@@ -26,6 +26,7 @@ from safetensors import safe_open
 from quant import common
 from quant import ecq
 from quant import ffcodec
+from quant import landing
 from quant.data import load_calibration
 from quant.data import load_train_rows
 from quant.fixed import mean_loss
@@ -120,6 +121,106 @@ def verify_roundtrip(out: Path, entries: list[ffcodec.Entry], sample: int | None
     log.info("decoder round trip bit-exact on %d tensors", len(records))
 
 
+def row_losses(model, rows) -> list[float]:
+    """Per-row mean supervised-token loss (NaN for a row with no scored token after the shift); the mean over the finite
+    entries is fixed.mean_loss (the quant_loss convention)."""
+    from quant.fixed import IGNORE_INDEX
+
+    device = next(model.parameters()).device
+    out = []
+    for row in rows:
+        ids = torch.tensor(row.input_ids, device=device).view(1, -1)
+        labels = torch.tensor(row.labels, device=device)
+        target = labels[1:]
+        mask = target != IGNORE_INDEX
+        if not mask.any():
+            out.append(float("nan"))
+            continue
+        logits = model(input_ids=ids, use_cache=False).logits[0, :-1].float()
+        lp = torch.log_softmax(logits[mask], dim=-1)
+        out.append(float(-lp.gather(1, target[mask].view(-1, 1)).mean()))
+    return out
+
+
+def _finite_mean(xs: list[float]) -> float:
+    v = [x for x in xs if x == x]
+    return sum(v) / max(1, len(v))
+
+
+def split_encoded(records: list[dict], frames: list[bytes]) -> dict[str, tuple[dict, list[bytes]]]:
+    """name -> (record with blob refs local to its own frame list, frames): lets candidates be mixed tensor by tensor."""
+    out = {}
+    for rec in records:
+        r, fl = {}, []
+        for k, v in rec.items():
+            if k in ("name", "shape", "enc", "group", "bits"):
+                r[k] = v
+            else:
+                r[k] = len(fl)
+                fl.append(frames[v])
+        out[rec["name"]] = (r, fl)
+    return out
+
+
+def join_encoded(parts: list[tuple[dict, list[bytes]]]) -> tuple[list[dict], list[bytes]]:
+    records, frames = [], []
+    for rec, fl in parts:
+        r = {k: (v + len(frames) if k not in ("name", "shape", "enc", "group", "bits") else v) for k, v in rec.items()}
+        records.append(r)
+        frames.extend(fl)
+    return records, frames
+
+
+def unit_of(name: str) -> int:
+    """Mixing unit: decoder block index, -1 for everything outside the blocks (embeddings, untied head)."""
+    import re
+
+    m = re.search(r"\.layers\.(\d+)\.", name)
+    return int(m.group(1)) if m else -1
+
+
+def tune_candidate(model, lin: dict, train_rows, sel_rows, budget_s: float, pad_id: int, deadline_left) -> dict[str, torch.Tensor]:
+    """End-to-end tuning of one ECQ candidate with its integer codes frozen (EfficientQAT E2E-QP, Chen et al. 2024,
+    arXiv:2407.11062; the fixed track's quant/tune.py): per-row steps (as one-group-per-row scales) plus norm weights and
+    biases, by the evaluator's loss on train rows; the best state by loss on sel_rows (held out of training) is kept.
+    Rewrites lin's steps in place (bf16-representable, so the decoder's bf16(code * step) equals the trained forward) and
+    returns the tuned raw 1-D tensors {name: bf16}. The model is left with QLinear modules (only measure() after this)."""
+    from quant import tune
+
+    qres = {n: QResult(q.codes, q.step.view(-1, 1).float(), torch.zeros(q.codes.shape[0], 1, dtype=torch.uint8)) for n, q in lin.items() if not is_embed_like(n)}
+    qlinears = {}
+    for name, module in list(model.named_modules()):
+        key = name + ".weight"
+        if isinstance(module, torch.nn.Linear) and key in qres:
+            parent_name, _, child = name.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            q = tune.QLinear(module, qres[key], module.weight.shape[1])
+            setattr(parent, child, q)
+            qlinears[key] = q
+            module.weight = None
+    torch.cuda.empty_cache()
+
+    def sel_loss() -> float:
+        # norms train in fp32 (train_scales): autocast keeps the bf16 head / embeddings consistent during selection
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            return _finite_mean(row_losses(model, sel_rows))
+
+    tune.train_scales(
+        model, qlinears, train_rows, sel_loss, deadline_left, pad_id,
+        lr=float(os.environ.get("QUANT_FF_TUNE_LR", 5e-4)), train_norms=os.environ.get("QUANT_FF_TUNE_NORMS", "1") == "1",
+        max_tokens=int(os.environ.get("QUANT_FF_TUNE_TOKENS", 16384)), epochs=float(os.environ.get("QUANT_FF_TUNE_EPOCHS", 3.0)),
+        budget_seconds=budget_s, eval_every=int(os.environ.get("QUANT_FF_TUNE_EVAL_EVERY", 50)),
+    )
+    for key, q in qlinears.items():
+        lin[key] = ecq.UResult(lin[key].codes, q.scale().detach().float().view(-1).cpu())
+    raw = {}
+    for name, p in model.named_parameters():
+        if ("norm" in name or name.endswith(".bias")) and p.dim() == 1:
+            p.data = p.data.to(torch.bfloat16)
+            raw[name] = p.data.detach().cpu().clone()
+    return raw
+
+
 def run(args) -> None:
     deadline = common.Deadline.from_hours(args.hours_to_complete)
     target = freeform_target()
@@ -135,11 +236,29 @@ def run(args) -> None:
     def group_for(shape, g):
         return g if shape[1] % g == 0 else None
 
-    best = {"S": float("inf"), "name": None, "r": None, "bytes": None}
+    best = {"S": float("inf"), "name": None, "r": None, "bytes": None, "score": float("inf")}
+    # QUANT_FF_LAND=expected (default): rank candidates by expected ln S under the noise model of quant/landing.py and
+    # aim at knee + delta; "under": the 17502ba rule (r_cal + margin must stay under the knee).
+    land = os.environ.get("QUANT_FF_LAND", "expected")
+    tgt = landing.Target.from_quant_target(common.quant_target())
+    log.info("landing %s: knee r %.4f cap r %.4f curvature %.1f (mode %s)", land, tgt.knee_r, tgt.cap_r, tgt.curv, landing.TARGET_MODE)
 
-    def consider(name: str, entries: list[ffcodec.Entry], r_pred: float, force: bool = False) -> None:
-        records, frames = ffcodec.encode(entries, level=level)
+    def consider(name: str, entries: list[ffcodec.Entry] | None, r_pred: float, force: bool = False, sigma: float | None = None, enc=None):
+        records, frames = enc if enc is not None else ffcodec.encode(entries, level=level)
         est = ffcodec.encoded_size(frames) + 2048 + HF_GITATTRIBUTES_BYTES + decoder_xz_estimate()
+        if land == "expected":
+            sg = sigma if sigma is not None else 0.003
+            score = tgt.expected_ln_s(est, r_pred, sg)
+            S = math.exp(min(score, 700.0)) if score < float("inf") else float("inf")
+            log.info("candidate %s: ~%.1f MB, predicted r %.4f +- %.4f, P(r>knee) %.2f, expected S %.1f MB (best %s %.1f MB)", name, est / 1e6,
+                     r_pred, sg, tgt.p_over(r_pred, sg, tgt.knee_r), S / 1e6, best["name"], best["S"] / 1e6)
+            if (force or score < best["score"]) and deadline.left() > 60:
+                info = {"candidate": name, "predicted_r": r_pred, "sigma": sg}
+                total = ffcodec.write_artifact(out, args.task_id, records, frames, info)
+                best.update(S=S, score=score, name=name, r=r_pred, bytes=total)
+                if os.environ.get("QUANT_FF_VERIFY", "1") == "1" and entries is not None:
+                    verify_roundtrip(out, entries, sample=None if base.bf16_bytes() < 4e9 else 24)
+            return records, frames, est
         S = penalised(est, r_pred, target)
         log.info("candidate %s: ~%.1f MB, predicted r %.4f, predicted S %.1f MB (best %s %.1f MB)", name, est / 1e6, r_pred, S / 1e6, best["name"], best["S"] / 1e6)
         # r_pred = measured calibration r + margin. A candidate predicted over the knee never replaces one predicted under
@@ -149,14 +268,15 @@ def run(args) -> None:
         best_feasible = best["r"] is not None and best["r"] <= target["knee"] and not str(best["name"]).startswith("rtn-")
         if not force and best_feasible and not feasible:
             log.info("candidate %s predicted over the knee: kept %s", name, best["name"])
-            return
+            return records, frames, est
         better = S < best["S"] or (feasible and not best_feasible)
         if (force or better) and deadline.left() > 60:
             info = {"candidate": name, "predicted_r": r_pred}
             total = ffcodec.write_artifact(out, args.task_id, records, frames, info)
             best.update(S=S, name=name, r=r_pred, bytes=total)
-            if os.environ.get("QUANT_FF_VERIFY", "1") == "1":
+            if os.environ.get("QUANT_FF_VERIFY", "1") == "1" and entries is not None:
                 verify_roundtrip(out, entries, sample=None if base.bf16_bytes() < 4e9 else 24)
+        return records, frames, est
 
     # 0. fallback: W8 g128 RTN on every 2-D weight
     t0 = time.time()
@@ -169,7 +289,7 @@ def run(args) -> None:
     gc.collect()
 
     if os.environ.get("QUANT_FF_MODE", "ecq") == "ecq":
-        run_ecq(args, deadline, target, base, names_2d, consider, best, margin, device, src)
+        run_ecq(args, deadline, target, base, names_2d, consider, best, margin, device, src, tgt if land == "expected" else None)
         log.info("final: %s, %s bytes, predicted r %s, predicted S %.1f MB, %.0fs elapsed", best["name"], best["bytes"], best["r"], best["S"] / 1e6, deadline.elapsed())
         return
 
@@ -255,7 +375,7 @@ def run(args) -> None:
     gc.collect()
 
 
-def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, device, src) -> None:
+def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, device, src, tgt=None) -> None:
     """ECQ (quant/ecq.py): GPTQ onto per-row uniform grids, steps = c * Fisher allocation, c searched so the
     calibration r lands just under the knee. Each probe is a full candidate (written when its predicted S is best)."""
     t_start = time.time()
@@ -274,8 +394,19 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         eval_rows, train = train[-min(200, len(train) // 4) :], train[: -min(200, len(train) // 4)]
     model = common.load_model(src, device_map=device)
     with torch.no_grad():
-        ref_loss = mean_loss(model, eval_rows)
+        ref_rows = row_losses(model, eval_rows)
+    ref_loss = _finite_mean(ref_rows)
     log.info("bf16 loss on %d eval rows: %.5f", len(eval_rows), ref_loss)
+    n_test = int(os.environ.get("QUANT_FF_TEST_ROWS", 1000))
+    sigma_floor = float(os.environ.get("QUANT_FF_SIGMA_FLOOR", 0.0015))
+    bias = float(os.environ.get("QUANT_FF_BIAS", 0.0))
+
+    def measure() -> tuple[float, float]:
+        """(calibration r, sigma of the test r around it) for the weights now in the model."""
+        with torch.no_grad():
+            rl = row_losses(model, eval_rows)
+        d = [a - b for a, b in zip(rl, ref_rows) if a == a and b == b]
+        return _finite_mean(rl) / ref_loss, landing.sigma_of(d, ref_loss, n_test, sigma_floor)
     pool = train if len(train) >= 128 else calib + train
     samples = [torch.tensor(r.input_ids) for r in pool[: int(os.environ.get("QUANT_GPTQ_ROWS", 256))]]
     embed_names = [n for n in names_2d if is_embed_like(n)]
@@ -298,6 +429,16 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     alloc.set_floor({n: base.tensor(n).float().abs().amax(1) for n in names_2d}, float(os.environ.get("QUANT_ECQ_MAX_CODE", 100)))
 
     aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.001))
+    size_pts: list[tuple[float, int]] = []  # (r, bytes) of encoded candidates: slope of ln bytes in r
+    sigma_now = float(os.environ.get("QUANT_FF_SIGMA0", 0.0025))
+    tune_f = float(os.environ.get("QUANT_FF_TUNE_F", 0.0)) if os.environ.get("QUANT_FF_TUNE", "0") == "1" else 0.0
+    pre = (lambda a: 1.0 + (a - 1.0) / (1.0 - tune_f)) if tune_f > 0 else (lambda a: a)
+    if tune_f > 0:  # rows for tuning: train rows minus a held-out selection slice
+        n_sel = min(128, max(16, len(train) // 10))
+        tune_sel, tune_train = train[-n_sel:], train[:-n_sel]
+    if tgt is not None:
+        aim = pre(tgt.aim(sigma_now, float(os.environ.get("QUANT_FF_SLOPE0", -8.0))) - bias)
+        log.info("landing aim r_cal %.4f (sigma %.4f, prior slope)", aim, sigma_now)
     # start: geometric-mean step / weight RMS = 0.2 (~4.4 bits/weight for Gaussian weights); the empirical Fisher of a
     # row's mean loss is ~1/tokens of the per-token curvature, so its absolute scale is not used, only its shape
     c = alloc.c_for_ratio(float(os.environ.get("QUANT_ECQ_STEP_OVER_RMS", 0.2)), rms)
@@ -398,6 +539,21 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             c_fit = math.exp((math.log(max(first_aim - 1.0, 1e-5)) - b) / a)
             c = min(c * 1.3, max(c / 1.3, c_fit))
         c *= float(os.environ.get("QUANT_ECQ_GPTQ_GAIN", 1.05))
+    final = None  # landing mode: the shipped candidate's codes (for the optional tuning stage)
+    keep: dict[str, dict] = {}  # landing mode: the closest probe under the aim ("lo") and over it ("hi"), codes kept for mixing
+
+    def bracket_next(c_now: float) -> float | None:
+        lo, hi = keep.get("lo"), keep.get("hi")
+        if lo is None or hi is None:
+            return None
+        x1, y1 = math.log(lo["c"]), math.log(max(lo["r"] - 1.0, 1e-5))
+        x2, y2 = math.log(hi["c"]), math.log(max(hi["r"] - 1.0, 1e-5))
+        if abs(y2 - y1) < 1e-9:
+            return None
+        x = x1 + (math.log(max(aim - 1.0, 1e-5)) - y1) * (x2 - x1) / (y2 - y1)
+        x = min(x1 + 0.8 * (x2 - x1), max(x1 + 0.2 * (x2 - x1), x))  # stay inside the bracket
+        return math.exp(x)
+
     for k in range(max_probes):
         # GPTQ itself switches to RTN when less than ~1.2 x its time is left beyond a 300 s margin: never start a probe
         # that would degrade that way (it costs time and lands nowhere useful)
@@ -439,9 +595,8 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             if n not in lin:
                 lin[n] = ecq.rtn_u(base.tensor(n), steps[n], device=device)
         set_weights(model, lin, 0)
-        with torch.no_grad():
-            loss = mean_loss(model, eval_rows)
-        r = loss / ref_loss
+        r, sigma = measure()
+        loss = r * ref_loss
         history.append((c, r))
         entries = []
         for name, shape in base.shapes.items():
@@ -450,15 +605,100 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             else:
                 entries.append(ffcodec.Entry(name, shape, tensor=base.tensor(name)))
         clipped = sum(int((q.codes.abs() == ecq.QMAX).sum()) for q in lin.values())
-        log.info("ECQ probe %d: c %.5g, eval loss %.5f r %.4f, clipped codes %d, %.0fs", k, c, loss, r, clipped, time.time() - t0)
-        consider(f"ecq-{alloc.kind}-c{c:.4g}", entries, r + margin)
+        log.info("ECQ probe %d: c %.5g, eval loss %.5f r %.4f (sigma %.4f), clipped codes %d, %.0fs", k, c, loss, r, sigma, clipped, time.time() - t0)
+        if tgt is None:
+            consider(f"ecq-{alloc.kind}-c{c:.4g}", entries, r + margin)
+        else:
+            records, frames, est = consider(f"ecq-{alloc.kind}-c{c:.4g}", entries, r + bias, sigma=sigma)
+            sc = tgt.expected_ln_s(est, 1.0 + (r - 1.0) * (1.0 - tune_f) + bias, sigma)
+            if final is None or sc < final["score"]:
+                final = {"lin": lin, "r": r, "name": f"ecq-{alloc.kind}-c{c:.4g}", "score": sc}
+            size_pts.append((r, est))
+            sigma_now = sigma
+            aim = pre(tgt.aim(sigma, landing.bytes_slope(size_pts) / (1.0 - tune_f)) - bias)
+            log.info("landing aim r_cal %.4f (sigma %.4f, slope %.2f)", aim, sigma, landing.bytes_slope(size_pts))
+            cand = {"c": c, "r": r, "sigma": sigma, "lin": lin, "enc": split_encoded(records, frames)}
+            side = "lo" if r <= aim else "hi"
+            other = "hi" if side == "lo" else "lo"
+            cur = keep.get(side)
+            if cur is None or (side == "lo" and r > cur["r"]) or (side == "hi" and r < cur["r"]):
+                keep[side] = cand
+            # a kept probe on the wrong side of the moved aim changes sides
+            for sd in ("lo", "hi"):
+                kp = keep.get(sd)
+                if kp is not None and ((sd == "lo" and kp["r"] > aim) or (sd == "hi" and kp["r"] <= aim)):
+                    keep.pop(sd)
+                    alt = "hi" if sd == "lo" else "lo"
+                    if alt not in keep or (alt == "lo" and kp["r"] > keep[alt]["r"]) or (alt == "hi" and kp["r"] < keep[alt]["r"]):
+                        keep[alt] = kp
+            del records, frames, cand
         probe_time = time.time() - t0
         del entries, lin
         gc.collect()
         if abs(r - aim) <= tol:
             break
+        if tgt is not None and "lo" in keep and "hi" in keep and keep["hi"]["c"] / keep["lo"]["c"] <= float(os.environ.get("QUANT_FF_MIX_WIDTH", 1.3)):
+            log.info("ECQ: bracket c %.4g / %.4g (r %.4f / %.4f) narrow enough: mixing", keep["lo"]["c"], keep["hi"]["c"], keep["lo"]["r"], keep["hi"]["r"])
+            break
+        nb = bracket_next(c) if tgt is not None else None
         # secant in log space: log(r - 1) = a log c + b (a ~ 2 for uniform noise); one point -> a = 2
-        c = next_gptq_c(history, rtn_hist, aim, c, r)
+        c = nb if nb is not None else next_gptq_c(history, rtn_hist, aim, c, r)
+
+    # Layer mix (landing mode): with a probe under the aim (lo) and one over it (hi), take the first m mixing units
+    # (decoder blocks, embeddings first) from hi and the rest from lo. r and bytes move in ~1/units steps between the two
+    # probes, so the landing gets much finer than a GPTQ probe can be placed, at the cost of one eval pass per step.
+    if tgt is not None and "lo" in keep and "hi" in keep and deadline.left() > 240:
+        lo, hi = keep["lo"], keep["hi"]
+        units = sorted({unit_of(n) for n in names_2d})
+        m_lo, r_lo, m_hi, r_hi = 0, lo["r"], len(units), hi["r"]
+        tol_mix = float(os.environ.get("QUANT_FF_MIX_TOL", 0.0008))
+        eval_time = None
+        for j in range(int(os.environ.get("QUANT_FF_MIX_EVALS", 5))):
+            if m_hi - m_lo <= 1 or (eval_time is not None and deadline.left() < eval_time * 2 + 180) or deadline.left() < 240:
+                break
+            t0 = time.time()
+            frac = (aim - r_lo) / max(1e-9, r_hi - r_lo)
+            m = int(round(m_lo + frac * (m_hi - m_lo)))
+            m = min(m_hi - 1, max(m_lo + 1, m))
+            from_hi = set(units[:m])
+            src_of = {n: (hi if unit_of(n) in from_hi else lo) for n in names_2d}
+            set_weights(model, {n: src_of[n]["lin"][n] for n in names_2d if n in params}, 0)
+            r, sigma = measure()
+            parts = [(src_of[name] if name in src_of else lo)["enc"][name] for name in base.shapes]
+            enc = join_encoded(parts)
+            mname = f"ecq-mix-c{lo['c']:.4g}-c{hi['c']:.4g}-m{m}of{len(units)}"
+            _, _, est = consider(mname, None, r + bias, sigma=sigma, enc=enc)
+            sc = tgt.expected_ln_s(est, 1.0 + (r - 1.0) * (1.0 - tune_f) + bias, sigma)
+            if final is None or sc < final["score"]:
+                final = {"lin": {n: src_of[n]["lin"][n] for n in names_2d}, "r": r, "name": mname, "score": sc}
+            size_pts.append((r, est))
+            eval_time = time.time() - t0
+            log.info("ECQ mix %d: %d/%d units from c %.4g, r %.4f (sigma %.4f), ~%.1f MB, %.0fs", j, m, len(units), hi["c"], r, sigma, est / 1e6, eval_time)
+            del parts, enc
+            if r <= aim:
+                m_lo, r_lo = m, r
+            else:
+                m_hi, r_hi = m, r
+            if abs(r - aim) <= tol_mix:
+                break
+    keep.clear()
+    gc.collect()
+    # Optional tuning stage (QUANT_FF_TUNE=1): the search above aimed QUANT_FF_TUNE_F of the excess higher (see aim), so the
+    # tuned candidate should land near the real aim; it is shipped only if its measured expected S is lower.
+    if tgt is not None and tune_f > 0 and final is not None and deadline.left() > 420:
+        t0 = time.time()
+        lin_t = dict(final["lin"])
+        budget = max(60.0, deadline.left() - float(os.environ.get("QUANT_FF_TUNE_RESERVE", 300)))
+        raw = tune_candidate(model, lin_t, tune_train, tune_sel, budget, tok.pad_token_id if tok.pad_token_id is not None else 0, deadline.left)
+        r, sigma = measure()
+        log.info("ECQ tuned %s: r %.4f -> %.4f (sigma %.4f), %.0fs", final["name"], final["r"], r, sigma, time.time() - t0)
+        entries = []
+        for name, shape in base.shapes.items():
+            if name in lin_t:
+                entries.append(ffcodec.Entry(name, shape, q=lin_t[name]))
+            else:
+                entries.append(ffcodec.Entry(name, shape, tensor=raw.get(name, base.tensor(name))))
+        consider(final["name"] + "-tuned", entries, r + bias, sigma=sigma)
     log.info("ECQ history (c, r): %s", ", ".join(f"({cc:.4g}, {rr:.4f})" for cc, rr in history))
 
     # Block-AP on the ECQ grid (EfficientQAT, Chen et al. 2024, arXiv:2407.11062): rounding learned per block against
