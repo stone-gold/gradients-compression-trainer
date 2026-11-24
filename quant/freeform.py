@@ -687,7 +687,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         log.info("ECQ RTN probe %d: c %.5g r %.4f (%.0fs)", k, c, r, rtn_time)
         k += 1
         if abs(r - aim) <= 0.003 or k >= n_rtn:
-            if not mga_done and tgt is not None and os.environ.get("QUANT_FF_MGA", "1") == "1":
+            if not mga_done and tgt is not None and os.environ.get("QUANT_FF_MGA", "0") == "1":
                 mga_done = True
                 c_m = min(rtn_hist, key=lambda x: abs(x[1] - aim))[0]
                 if measured_group_allocation(c_m, rtn_time):
