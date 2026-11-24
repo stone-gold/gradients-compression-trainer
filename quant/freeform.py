@@ -884,7 +884,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     if os.environ.get("QUANT_ECQ_BAP", "0") == "1" and history:
         from quant.blockap import blockap
 
-        feasible = [cc for cc, rr in history if rr + margin <= target["knee"]]
+        feasible = [cc for cc, rr in history if (rr <= aim if tgt is not None else rr + margin <= target["knee"])]
         c_b = (max(feasible) if feasible else min(history)[0]) * float(os.environ.get("QUANT_ECQ_BAP_GAIN", 1.15))
         bap_hist: list[tuple[float, float]] = []
         bap_time = None
@@ -920,13 +920,14 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 if n not in lin:
                     lin[n] = ecq.rtn_u(base.tensor(n), steps[n], device=device)
             set_weights(model, {n: lin[n] for n in names_2d if is_embed_like(n) or n not in res}, 0)
-            with torch.no_grad():
-                loss = mean_loss(model, eval_rows)
-            r = loss / ref_loss
+            r, sigma = measure()
             bap_hist.append((c_b, r))
             entries = [ffcodec.Entry(name, shape, q=lin[name]) if name in lin else ffcodec.Entry(name, shape, tensor=base.tensor(name)) for name, shape in base.shapes.items()]
             log.info("ECQ Block-AP probe %d: c %.5g r %.4f (%.0fs)", k, c_b, r, time.time() - t0)
-            consider(f"ecq-bap-c{c_b:.4g}", entries, r + margin)
+            if tgt is None:
+                consider(f"ecq-bap-c{c_b:.4g}", entries, r + margin)
+            else:
+                consider(f"ecq-bap-c{c_b:.4g}", entries, r + bias, sigma=sigma)
             bap_time = time.time() - t0
             del entries, lin, res
             gc.collect()
