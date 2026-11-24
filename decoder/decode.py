@@ -11,7 +11,7 @@ zstd frame. Tensor encodings:
        np.argsort(rowkey, kind="stable") order. Optional col float32 [in]: w = bf16(code * (step[row] * col[column])).
   codes_rans (instead of codes): the same int8 codes coded with static row-class-context rANS (see rans_decode).
 Output: top-level *.safetensors with exactly the tensors listed, all bf16. Deterministic: no randomness, no threads
-racing on shared output (rANS artifacts decode tensors in a process pool; results are consumed in manifest order).
+racing on shared output (the rANS stage runs in a process pool over tensors; results are consumed in manifest order).
 """
 
 import json
@@ -149,7 +149,7 @@ def rans_decode(blob: bytes, rows: int, cols: int, key_sorted: np.ndarray) -> np
     return (out[:n] - 128).astype(np.int8).reshape(rows, cols)
 
 
-def decode_tensor(blobs: Blobs, t: dict) -> torch.Tensor:
+def decode_tensor(blobs: Blobs, t: dict, rans_codes: np.ndarray | None = None) -> torch.Tensor:
     shape = t["shape"]
     n = int(np.prod(shape)) if shape else 1
     if t["enc"] == "raw":
@@ -167,7 +167,9 @@ def decode_tensor(blobs: Blobs, t: dict) -> torch.Tensor:
         key = np.frombuffer(bytes(blobs.get(t["rowkey"], out_f)), dtype=np.uint8) if "rowkey" in t else None
         if "codes_rans" in t:  # rANS-coded codes (stored row order; contexts from the row keys)
             sorted_key = np.sort(key, kind="stable") if key is not None else np.zeros(out_f, dtype=np.uint8)
-            codes = torch.from_numpy(rans_decode(blobs.raw(t["codes_rans"]), out_f, in_f, sorted_key))
+            if rans_codes is None:
+                rans_codes = rans_decode(blobs.raw(t["codes_rans"]), out_f, in_f, sorted_key)
+            codes = torch.from_numpy(rans_codes)
         else:
             codes = torch.frombuffer(blobs.get(t["codes"], out_f * in_f), dtype=torch.int8).view(out_f, in_f)
         if key is not None:  # rows were stored sorted (stable) by a 1-byte key: put them back
@@ -184,31 +186,36 @@ def decode_tensor(blobs: Blobs, t: dict) -> torch.Tensor:
 _BLOBS = None
 
 
-def _worker_init() -> None:
-    torch.set_num_threads(1)
-
-
-def _decode_one(t: dict) -> torch.Tensor:
-    return decode_tensor(_BLOBS, t).contiguous()
+def _rans_codes(t: dict) -> np.ndarray:
+    """Worker: rANS-decode one tensor's codes (numpy only; no torch in forked workers)."""
+    out_f, in_f = t["shape"]
+    key = np.frombuffer(bytes(_BLOBS.get(t["rowkey"], out_f)), dtype=np.uint8)
+    return rans_decode(_BLOBS.raw(t["codes_rans"]), out_f, in_f, np.sort(key, kind="stable"))
 
 
 def decoded_tensors(blobs: Blobs, tensors: list[dict]):
-    """Tensors in manifest order. rANS-coded artifacts are decoded by a fork pool over tensors (one tensor per task,
-    results consumed in order: the output does not depend on the number of workers)."""
+    """Tensors in manifest order. The rANS stage (numpy, integer-only) runs in a fork pool over tensors; dequantisation
+    stays in this process. Results are consumed in manifest order, so the output does not depend on the worker count."""
     global _BLOBS
     _BLOBS = blobs
     try:
         ncpu = len(os.sched_getaffinity(0))
     except AttributeError:
         ncpu = os.cpu_count() or 1
-    if ncpu > 1 and any("codes_rans" in t for t in tensors):
+    coded = [t for t in tensors if "codes_rans" in t and "rowkey" in t]
+    if ncpu > 1 and coded:
         import multiprocessing
 
-        with multiprocessing.get_context("fork").Pool(min(16, ncpu), initializer=_worker_init) as pool:
-            yield from pool.imap(_decode_one, tensors, chunksize=1)
+        with multiprocessing.get_context("fork").Pool(min(16, ncpu)) as pool:
+            it = pool.imap(_rans_codes, coded, chunksize=1)
+            for t in tensors:
+                pre = next(it) if (coded and t is coded[0]) else None
+                if pre is not None:
+                    coded.pop(0)
+                yield decode_tensor(blobs, t, pre).contiguous()
     else:
         for t in tensors:
-            yield _decode_one(t)
+            yield decode_tensor(blobs, t).contiguous()
 
 
 def main(artifact: str, output: str) -> None:
