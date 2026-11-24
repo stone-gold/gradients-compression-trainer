@@ -215,7 +215,16 @@ def _viterbi_block(Wb, s_row, hcol, Ub, start, tabs: "_Tables", feedback: bool):
             _CACHE.clear()
             tr = _CACHE[key] = _Trellis(R, B, dev, feedback, rated)
         graph = bool(_GRAPH_STATE["ok"])
-    return tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=graph)
+    if not graph:
+        return tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=False)
+    try:
+        return tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=True)
+    except Exception as exc:  # noqa: BLE001 - a capture for a new shape failed: eager from here on
+        log.warning("trellis CUDA graph failed for shape %s (%s): eager steps", key, exc)
+        _GRAPH_STATE["ok"] = False
+        _CACHE.clear()
+        tr = _CACHE[key] = _Trellis(R, B, dev, feedback, rated)
+        return tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=False)
 
 
 def _hcol(Ud: torch.Tensor) -> torch.Tensor:
