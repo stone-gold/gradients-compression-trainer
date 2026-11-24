@@ -588,11 +588,86 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         c_new = c_now * math.exp((math.log(max(target - 1.0, 1e-5)) - math.log(max(r_now - 1.0, 1e-5))) / a)
         return min(c_now * 1.25, max(c_now / 1.25, c_new))
 
+    def group_key(n: str) -> str:
+        leaf = n.rsplit(".", 2)[-2] if n.count(".") >= 1 else n
+        return ("embed:" + leaf) if is_embed_like(n) else leaf
+
+    def measured_group_allocation(c_m: float, t_rtn: float | None) -> bool:
+        """Measured re-allocation between tensor groups (q/k/v/o/gate/up/down/embeddings, by module name). The Fisher
+        allocation assumes loss ~ f * step^2 everywhere; on fine-tuned models the measured marginal cost differs by
+        5-10x between groups (t15: k_proj 0.33, o_proj 2.5 MB per 0.001 r; the tied embedding ~free). At c_m, each group's
+        steps are scaled by F alone (RTN onto the grid, one eval each), giving its bytes saved per unit r; groups then get
+        factor (e_g / e_mean)^alpha (clamped), which moves the allocation toward equal marginal cost. Returns True if
+        the allocation changed."""
+        groups: dict[str, list[str]] = {}
+        for n in names_2d:
+            groups.setdefault(group_key(n), []).append(n)
+        if len(groups) < 2:
+            return False
+        need = (t_rtn or 60.0) * (len(groups) + 1) * 1.5 + 60
+        if deadline.left() < need + float(os.environ.get("QUANT_FF_MGA_RESERVE", 1500)):
+            log.info("MGA: skipped (%.0fs left, needs ~%.0fs)", deadline.left(), need)
+            return False
+        t0 = time.time()
+        F = float(os.environ.get("QUANT_FF_MGA_FACTOR", 1.4))
+        alpha = float(os.environ.get("QUANT_FF_MGA_ALPHA", 0.5))
+        lo_f, hi_f = float(os.environ.get("QUANT_FF_MGA_MIN", 0.5)), float(os.environ.get("QUANT_FF_MGA_MAX", 2.0))
+        steps0 = alloc.steps(c_m)
+        from concurrent.futures import ThreadPoolExecutor
+
+        def sizes(res: dict) -> dict[str, int]:
+            with ThreadPoolExecutor(16) as ex:
+                return dict(zip(res, ex.map(lambda q: len(ffcodec._compress(q.codes.numpy().tobytes(), 0, True)), res.values())))
+
+        restore()
+        res0 = {n: ecq.rtn_u(params[n].data, steps0[n], device=device) for n in names_2d if n in params}
+        set_weights(model, res0, 0)
+        with torch.no_grad():
+            r0 = mean_loss(model, eval_rows) / ref_loss
+        size0 = sizes(res0)
+        del res0
+        eff: dict[str, float] = {}
+        gbytes: dict[str, int] = {}
+        for g, ns in groups.items():
+            ns = [n for n in ns if n in params]
+            if not ns:
+                continue
+            restore()
+            res = {n: ecq.rtn_u(params[n].data, steps0[n] * (F if n in ns else 1.0), device=device) for n in names_2d if n in params}
+            set_weights(model, res, 0)
+            with torch.no_grad():
+                r1 = mean_loss(model, eval_rows) / ref_loss
+            s1 = sizes({n: res[n] for n in ns})
+            del res
+            dB = sum(size0[n] - s1[n] for n in ns)
+            dr = r1 - r0
+            gbytes[g] = sum(size0[n] for n in ns)
+            eff[g] = dB / max(dr, 2e-4)  # bytes saved per unit r (a change under the noise counts as 0.0002)
+            log.info("MGA %s: %.1f MB, x%.2f steps: -%.2f MB, dr %+.4f -> %.2f MB per 0.001 r", g, gbytes[g] / 1e6, F, dB / 1e6, dr, eff[g] / 1e9)
+        pos = {g: e for g, e in eff.items() if e > 0}
+        if len(pos) < 2:
+            return False
+        tot = sum(gbytes[g] for g in pos)
+        gm = math.exp(sum(gbytes[g] * math.log(e) for g, e in pos.items()) / tot)
+        changed = False
+        for g, e in pos.items():
+            f = min(hi_f, max(lo_f, (e / gm) ** alpha))
+            if abs(f - 1.0) > 0.02:
+                changed = True
+                for n in groups[g]:
+                    alloc.base[n] = alloc.base[n] * f
+            log.info("MGA factor %s: %.3f", g, f)
+        log.info("MGA: base r %.4f, %d groups, %.0fs", r0, len(eff), time.time() - t0)
+        return changed
+
     # Cheap bracketing with RTN onto the same grids (seconds per probe instead of minutes): GPTQ then starts at the
     # RTN landing point, where its r is lower (safe side), and the secant steps up from there.
     n_rtn = int(os.environ.get("QUANT_ECQ_RTN_PROBES", 4))
     rtn_hist: list[tuple[float, float]] = []
-    for k in range(n_rtn):
+    mga_done = False
+    rtn_time = None
+    k = 0
+    while k < n_rtn:
         if deadline.left() < 600:
             break
         t0 = time.time()
@@ -604,8 +679,19 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         with torch.no_grad():
             r = mean_loss(model, eval_rows) / ref_loss
         rtn_hist.append((c, r))
-        log.info("ECQ RTN probe %d: c %.5g r %.4f (%.0fs)", k, c, r, time.time() - t0)
-        if abs(r - aim) <= 0.003:
+        rtn_time = time.time() - t0
+        log.info("ECQ RTN probe %d: c %.5g r %.4f (%.0fs)", k, c, r, rtn_time)
+        k += 1
+        if abs(r - aim) <= 0.003 or k >= n_rtn:
+            if not mga_done and tgt is not None and os.environ.get("QUANT_FF_MGA", "1") == "1":
+                mga_done = True
+                c_m = min(rtn_hist, key=lambda x: abs(x[1] - aim))[0]
+                if measured_group_allocation(c_m, rtn_time):
+                    # the allocation changed: bracket again from the same c
+                    rtn_hist.clear()
+                    k = 0
+                    c = c_m
+                    continue
             break
         line = rtn_curve(rtn_hist)
         if line is None:
