@@ -221,6 +221,54 @@ def tune_candidate(model, lin: dict, train_rows, sel_rows, budget_s: float, pad_
     return raw
 
 
+def used_token_ids(task_id: str, dataset_arg: str, tok, extra_rows, time_limit: float) -> set[int] | None:
+    """Token ids that occur anywhere in the task's train split (every string field of every row, tokenised in batches by
+    the fast tokenizer), in the calibration rows and in the tokenizer's special / added tokens. None if the split cannot
+    be read completely within time_limit (then nothing is trimmed)."""
+    import itertools
+
+    t_end = time.time() + time_limit
+    path = next((p for p in (f"/cache/datasets/{task_id}_train_data.json", dataset_arg) if p and os.path.exists(p)), None)
+    if path is None:
+        return None
+    with open(path) as f:
+        rows = json.load(f)
+    if isinstance(rows, dict):
+        rows = next((v for v in rows.values() if isinstance(v, list)), [])
+
+    def strings(x):
+        if isinstance(x, str):
+            yield x
+        elif isinstance(x, dict):
+            for v in x.values():
+                yield from strings(v)
+        elif isinstance(x, list):
+            for v in x:
+                yield from strings(v)
+
+    used: set[int] = set()
+    it = iter(rows)
+    while True:
+        chunk = list(itertools.islice(it, 512))
+        if not chunk:
+            break
+        if time.time() > t_end:
+            log.warning("vocab trim: token scan out of time, no trimming")
+            return None
+        texts = [t for r in chunk for t in strings(r) if t]
+        for ids in tok(texts, add_special_tokens=False)["input_ids"]:
+            used.update(ids)
+    for r in extra_rows:
+        used.update(r.input_ids)
+    used.update(int(i) for i in (tok.all_special_ids or []))
+    used.update(int(i) for i in getattr(tok, "added_tokens_decoder", {}).keys())
+    for t in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"):
+        v = getattr(tok, t, None)
+        if v is not None:
+            used.add(int(v))
+    return used
+
+
 def run(args) -> None:
     deadline = common.Deadline.from_hours(args.hours_to_complete)
     target = freeform_target()
@@ -427,6 +475,22 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     clamp = {n: float(os.environ.get("QUANT_ECQ_EMBED_CLAMP" if n in embed_names else "QUANT_ECQ_ROW_CLAMP", 4.0)) for n in names_2d}
     alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, clamp)
     alloc.set_floor({n: base.tensor(n).float().abs().amax(1) for n in names_2d}, float(os.environ.get("QUANT_ECQ_MAX_CODE", 100)))
+    # Vocabulary trim (QUANT_FF_VOCAB_TRIM=1): embedding / head rows of tokens that never occur in the task's data are
+    # quantised to zero (step far above the row's range): an input row that is never looked up costs nothing, and a zero
+    # head row gives that token logit 0 instead of its trained value. Measured on the calibration rows like everything else.
+    if os.environ.get("QUANT_FF_VOCAB_TRIM", "1") == "1" and embed_names:
+        t0 = time.time()
+        # calibration rows are NOT added: they must see unseen-token misses at the rate the scored rows will
+        used = used_token_ids(args.task_id, args.dataset, tok, [], float(os.environ.get("QUANT_FF_VOCAB_SECONDS", 240)))
+        if used:
+            for n in embed_names:
+                rows_n = base.shapes[n][0]
+                mask = torch.ones(rows_n, dtype=torch.bool)
+                ids = torch.tensor(sorted(i for i in used if 0 <= i < rows_n), dtype=torch.long)
+                mask[ids] = False
+                alloc.base[n] = torch.where(mask, torch.full_like(alloc.base[n], 1e30), alloc.base[n])
+                alloc.floor.setdefault(n, torch.zeros(rows_n))
+            log.info("vocab trim: %d of %d token ids used; %d rows zeroed per embedding tensor (%.0fs)", len(used), rows_n, int(mask.sum()), time.time() - t0)
 
     aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.001))
     size_pts: list[tuple[float, int]] = []  # (r, bytes) of encoded candidates: slope of ln bytes in r

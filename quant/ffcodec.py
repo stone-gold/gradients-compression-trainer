@@ -76,6 +76,12 @@ def _params(level: int):
 def _compress(raw: bytes, level: int, codes: bool) -> bytes:
     """Codes: one frame at `level`. Other blobs (bf16 tensors, scales, zeros): also try level 9, keep the smaller."""
     out = zstandard.ZstdCompressor(compression_params=_params(level)).compress(raw)
+    if level <= 0 and codes and len(raw) > 1 << 20 and raw.count(0) > len(raw) // 2:
+        # mostly-zero codes (vocab-trimmed embedding rows, stored contiguously by the row sort): Huffman literals cost
+        # >= 1 bit per zero, LZ matches cost ~nothing per run; a standard zstd frame either way (decoder unchanged)
+        alt = zstandard.ZstdCompressor(compression_params=_params(3)).compress(raw)
+        if len(alt) < len(out):
+            out = alt
     if level <= 0 and not codes:
         alt = zstandard.ZstdCompressor(compression_params=_params(9)).compress(raw)
         if len(alt) < len(out):
