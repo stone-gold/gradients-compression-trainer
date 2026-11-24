@@ -262,6 +262,7 @@ def quantize_model_gptq(
             if isinstance(m, nn.Linear) and m.weight.shape[1] % spec.group == 0
         }
         remaining = dict(linears)
+        stages_seen: list[str] = []  # stage split of this layer, logged once per layer (L5 review: o_proj must never share a stage with gate/up)
         while remaining:
             Hs = {n: None for n in remaining}
             counts = {n: 0 for n in remaining}
@@ -307,6 +308,7 @@ def quantize_model_gptq(
                 held.clear()
             else:
                 stage = list(remaining)
+            stages_seen.append(",".join(n.rsplit(".", 1)[-1] for n in stage))
             if (
                 group_quantizer is not None
                 and not use_rtn
@@ -339,6 +341,8 @@ def quantize_model_gptq(
         for i, (hidden, args, kwargs) in enumerate(store):
             hiddens[i] = run_layer(layer, hiddens[i], args, kwargs)
         dt = time.time() - tl
+        if not use_rtn:
+            log.info("GPTQ layer %d stages %s", li, " | ".join(stages_seen))
         left_layers = len(layers) - li - 1
         if not use_rtn and dt * left_layers * 1.2 > time_left():
             log.warning("GPTQ out of time after layer %d (%.1fs/layer, %.0fs left): RTN for the rest", li, dt, time_left())
