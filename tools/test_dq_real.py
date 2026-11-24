@@ -40,11 +40,12 @@ for hk, ns in groups.items():
         bits, cls = dq.rate_model(wcat, d, "cpu", 512)
         kw = {"lam": lam, "bits": bits, "cls": cls}
     t0 = time.time()
-    u = dq.gptq_dq(wcat, data[hk].float(), d, act_order="b16", **kw)
+    u = dq.gptq_dq(wcat, data[hk].float(), d, act_order="b16", split=[w.shape[0] for w in ws], **kw)
     print(hk, tuple(wcat.shape), "%.1fs" % (time.time() - t0), flush=True)
     r0 = 0
-    for n, w in zip(ns, ws):
-        res[n] = dq.UResult(u.codes[r0 : r0 + w.shape[0]].contiguous(), u.step[r0 : r0 + w.shape[0]].contiguous(), dq=True, perm=u.perm, okey=u.okey, chunk=u.chunk)
+    for i, (n, w) in enumerate(zip(ns, ws)):
+        res[n] = dq.UResult(u.codes[r0 : r0 + w.shape[0]].contiguous(), u.step[r0 : r0 + w.shape[0]].contiguous(), dq=True, perm=u.perm, okey=u.okey,
+                            chunk=u.chunk, est=u.est[i])
         r0 += w.shape[0]
 entries = [ffcodec.Entry(n, list(res[n].codes.shape), q=res[n]) for n in names]
 t0 = time.time()
@@ -64,5 +65,8 @@ for t in meta["tensors"]:
     assert torch.equal(got.view(torch.int16), by[t["name"]].dequant().contiguous().view(torch.int16)), t["name"]
 dec_s = time.time() - t0
 coders = {t["name"].split(".")[-2]: [k for k in t if k.startswith("codes")][0] for t in meta["tensors"]}
+for t in meta["tensors"]:
+    if "codes_dq" in t:
+        print("est vs coded", t["name"].split(".")[-2], by[t["name"]].q.est, t["codes_dq"][2], "%+.2f%%" % (100.0 * (by[t["name"]].q.est / t["codes_dq"][2] - 1)))
 print(json.dumps({"tensors": len(meta["tensors"]), "bytes": total, "coders": coders, "encode_s": round(enc_s, 1), "decode_s_serial": round(dec_s, 1)}))
 print("OK bit-exact")

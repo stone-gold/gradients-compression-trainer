@@ -37,6 +37,7 @@ class UResult:
     perm: torch.Tensor | None = None  # dq only: column order of the trellis (int64 [in]); None = natural order
     okey: torch.Tensor | None = None  # dq only: uint8 [in] bucket key with perm = stable argsort(okey), or None
     chunk: int = 0  # dq only: trellis restart period in columns (trellis order); 0 = once per row
+    est: int | list | None = None  # dq only: estimated size of the state-aware coding (quant/dq.py est_bytes)
 
     def grid(self) -> torch.Tensor:
         s = self.step.float().unsqueeze(1).to(self.codes.device)

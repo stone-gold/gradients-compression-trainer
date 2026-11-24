@@ -328,6 +328,12 @@ def run(args) -> None:
     def consider(name: str, entries: list[ffcodec.Entry] | None, r_pred: float, force: bool = False, sigma: float | None = None, enc=None):
         records, frames = enc if enc is not None else ffcodec.encode(entries, level=level)
         est = ffcodec.encoded_size(frames) + 2048 + HF_GITATTRIBUTES_BYTES + decoder_xz_estimate()
+        if entries is not None:
+            # trellis codes sit in plain zstd frames until the final coding (+~34%): count their estimated final size
+            dq_est = {e.name: e.q.est for e in entries if e.q is not None and getattr(e.q, "dq", False) and isinstance(getattr(e.q, "est", None), int)}
+            for rec in records:
+                if rec["name"] in dq_est and "codes" in rec:
+                    est += dq_est[rec["name"]] - len(frames[rec["codes"]])
         if land == "expected":
             sg = sigma if sigma is not None else 0.003
             score = tgt.expected_ln_s(est, r_pred, sg)
@@ -841,10 +847,11 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 if dq_lam > 0:
                     bits, cls = dq.rate_model(wcat, d, H.device, dq_rate_cols)
                     kw = {"lam": dq_lam, "bits": bits, "cls": cls}
-                u = dq.gptq_dq(wcat, H, d, damp=damp, blocksize=dq_block, act_order=dq_order, **kw)
+                u = dq.gptq_dq(wcat, H, d, damp=damp, blocksize=dq_block, act_order=dq_order, split=sizes, **kw)
                 out, r0 = [], 0
-                for sz in sizes:
-                    out.append(ecq.UResult(u.codes[r0 : r0 + sz].contiguous(), u.step[r0 : r0 + sz].contiguous(), dq=True, perm=u.perm, okey=u.okey, chunk=u.chunk))
+                for i, sz in enumerate(sizes):
+                    out.append(ecq.UResult(u.codes[r0 : r0 + sz].contiguous(), u.step[r0 : r0 + sz].contiguous(), dq=True, perm=u.perm, okey=u.okey,
+                                           chunk=u.chunk, est=u.est[i]))
                     r0 += sz
                 return out
             if col_alpha > 0 or use_dq:

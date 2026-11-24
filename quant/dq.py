@@ -133,7 +133,7 @@ class _Trellis:
         self.graph = g
 
     def run(self, Wb, grid, hcol, Ub, start, rate_rows, use_graph: bool):
-        """-> (n [R, B] float, end states [R]) for one full block."""
+        """-> (n [R, B] float, end states [R], state in which each code was coded [R, B] uint8) for one block."""
         R, B = self.R, self.B
         if self.feedback:
             self.W.copy_(Wb.unsqueeze(1).expand(R, 4, B))
@@ -159,13 +159,15 @@ class _Trellis:
         t = end.clone()
         rows = torch.arange(R, device=self.device)
         out = torch.empty((R, B), device=self.device)
+        sts = torch.empty((R, B), device=self.device, dtype=torch.uint8)
         bn, bs = self.back_n.long(), self.back_s.long()
         for jj in range(B - 1, -1, -1):
             out[:, jj] = bn[jj, rows, t].float()
             t = bs[jj, rows, t]
+            sts[:, jj] = t.to(torch.uint8)
         if not torch.equal(t, start):
             raise RuntimeError("trellis backtrack did not reach the start state")
-        return out, end
+        return out, end, sts
 
 
 _CACHE: dict = {}
@@ -182,7 +184,7 @@ def _graphs_wanted(device) -> bool:
 def _viterbi_block(Wb, s_row, hcol, Ub, start, tabs: "_Tables", feedback: bool):
     """One block of columns. Wb [R, B] (current, feedback-updated weights), s_row [R] or [R, B] grid, hcol [B] column
     weights 1/U_ii^2 (normalised), Ub [B, B] upper Cholesky block (feedback only), start [R] states.
-    Returns n [R, B] (float, integer valued) and end states [R].
+    Returns n [R, B] (float, integer valued), end states [R] and the state of every code [R, B] (uint8).
 
     Per column and survivor state s the candidates are the two nearest levels of the state's quantiser and zero;
     for each (s, parity of k) the cheapest candidate goes on, and each next state t takes the cheaper of its two
@@ -202,8 +204,8 @@ def _viterbi_block(Wb, s_row, hcol, Ub, start, tabs: "_Tables", feedback: bool):
     if graph and _GRAPH_STATE["ok"] is None:
         # first use on this process: the graph replay must give the eager result (else graphs stay off)
         try:
-            n_e, e_e = tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=False)
-            n_g, e_g = tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=True)
+            n_e, e_e, _ = tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=False)
+            n_g, e_g, _ = tr.run(Wb, s_row, hcol, Ub_, start, tabs.rows, use_graph=True)
             _GRAPH_STATE["ok"] = bool(torch.equal(n_e, n_g) and torch.equal(e_e, e_g))
         except Exception as exc:  # noqa: BLE001
             log.warning("trellis CUDA graph failed (%s): eager steps", exc)
@@ -232,6 +234,46 @@ def order_key(hdiag: torch.Tensor, buckets: int = 16) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _splits(rows: int, split: list[int] | None):
+    if not split:
+        return [(0, rows)]
+    out, r0 = [], 0
+    for n in split:
+        out.append((r0, r0 + n))
+        r0 += n
+    if r0 != rows:
+        raise ValueError("split does not cover the rows")
+    return out
+
+
+@torch.no_grad()
+def est_bytes(codes_t: torch.Tensor, states: torch.Tensor, okey: bool, perm: bool, chunk: int) -> int:
+    """Estimated size of rans.encode_dq for one tensor from its trellis-order codes and states (on their device):
+    empirical entropy of k given (row class, state) + tables (~half their raw size after zstd) + lane states + order."""
+    R, C = codes_t.shape
+    if R * C == 0:
+        return 0
+    n = codes_t.long()
+    s = states.long()
+    k = torch.div(n + (s >> 1) * torch.sign(n), 2, rounding_mode="floor")
+    spread = n.abs().float().mean(1)
+    key = torch.clamp(torch.round(16.0 * torch.log2(spread + 1e-3)) + 128, 0, 255)
+    _, cls = torch.unique(key, return_inverse=True)
+    nctx = (int(cls.max()) + 1) * 4
+    cnt = torch.bincount(((cls.view(-1, 1) * 4 + s) * NK + (k + KOFF).clamp(0, NK - 1)).flatten(), minlength=nctx * NK).double().view(nctx, NK)
+    tot = cnt.sum(1, keepdim=True)
+    nz = cnt > 0
+    bits = float((cnt[nz] * torch.log2((tot.expand_as(cnt))[nz] / cnt[nz])).sum())
+    used = nz.any(1)
+    first = torch.where(nz, torch.arange(NK, device=cnt.device), NK).min(1).values
+    last = torch.where(nz, torch.arange(NK, device=cnt.device), -1).max(1).values
+    table = float(((last - first + 1).clamp(min=0) * 2 + 4)[used].sum()) * 0.5
+    ch = chunk if chunk else C
+    lanes = -(-(R * C) // (max(1, 4096 // ch) * ch))
+    order = ((C + 1) // 2 if okey else 2 * C) if perm else 0
+    return int(bits / 8 + table + 4 * lanes + 32 + order)
+
+
 def chunk_for(cols: int, block: int = 128, longest: int = 1024) -> int:
     """Trellis restart period (columns in trellis order): the largest multiple of the GPTQ block <= longest that
     divides cols, else cols (one chain per row). Every chunk starts in state 0, so the decoder can run many short
@@ -245,14 +287,15 @@ def chunk_for(cols: int, block: int = 128, longest: int = 1024) -> int:
 @torch.no_grad()
 def gptq_dq(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: float = 0.01, blocksize: int = 128, act_order: bool | str = True,
             col: torch.Tensor | None = None, lam: float = 0.0, bits: torch.Tensor | None = None, cls: torch.Tensor | None = None,
-            chunk: int | None = None) -> UResult:
+            chunk: int | None = None, split: list[int] | None = None) -> UResult:
     """GPTQ with a 4-state trellis per row onto step[row] * col[column] * n (n as in the module docstring).
     weight [out, in], H [in, in] fp32 on the compute device. lam > 0 with bits [K, 4, NK] and cls [out] adds
     lam * bits(k | row class, state) to the path metric (units: squared error in steps, columns weighted by 1/U_ii^2
     normalised to mean 1). act_order: True = exact act order (full permutation stored), "b16" = bucketed act order
     (16 buckets, 4 bits per column stored), False = natural order. Returns UResult with dq=True, the column order of
     the trellis (perm, None = natural) and, for bucketed order, its key (okey). chunk: trellis restart period
-    (a multiple of blocksize dividing in, or in; default chunk_for(in, blocksize))."""
+    (a multiple of blocksize dividing in, or in; default chunk_for(in, blocksize)). split: row counts of stacked
+    tensors; UResult.est is then a list of estimated coded sizes per tensor (else an int)."""
     dev = H.device
     W = weight.to(device=dev, dtype=torch.float32).clone()
     out_f, in_f = W.shape
@@ -288,6 +331,7 @@ def gptq_dq(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: flo
     if chunk != in_f and (chunk % blocksize or in_f % chunk):
         raise ValueError("chunk must be a multiple of the block size dividing the column count")
     state = torch.zeros(out_f, dtype=torch.long, device=dev)
+    states = torch.empty((out_f, in_f), dtype=torch.uint8, device=dev)
     for i1 in range(0, in_f, blocksize):
         i2 = min(i1 + blocksize, in_f)
         if i1 % chunk == 0:
@@ -295,8 +339,9 @@ def gptq_dq(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: flo
         W1 = W[:, i1:i2].clone()
         Hinv1 = Hinv[i1:i2, i1:i2]
         grid = s_row if c_col is None else s_row.unsqueeze(1) * c_col[i1:i2].unsqueeze(0)  # same fp32 product as UResult.grid()
-        nb, state = _viterbi_block(W1, grid, hcol[i1:i2], Hinv1, state, tabs, feedback=True)
+        nb, state, sts = _viterbi_block(W1, grid, hcol[i1:i2], Hinv1, state, tabs, feedback=True)
         codes[:, i1:i2] = nb.to(torch.int8)
+        states[:, i1:i2] = sts
         # replay the chosen codes through the ordinary GPTQ block update (exact feedback of the kept path)
         Err1 = torch.zeros_like(W1)
         for i in range(i2 - i1):
@@ -305,12 +350,14 @@ def gptq_dq(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: flo
             W1[:, i:] -= err.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
             Err1[:, i] = err
         W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+    est = [est_bytes(codes[r0:r1], states[r0:r1], okey is not None, perm is not None, chunk) for r0, r1 in _splits(out_f, split)]
     if perm is not None:
         unperm = torch.empty_like(codes)
         unperm[:, perm] = codes
         codes = unperm
     return UResult(codes.cpu(), step.float().cpu(), None if col is None else col.float().cpu(), dq=True,
-                   perm=None if perm is None else perm.cpu().to(torch.int64), okey=None if okey is None else okey.cpu(), chunk=chunk)
+                   perm=None if perm is None else perm.cpu().to(torch.int64), okey=None if okey is None else okey.cpu(), chunk=chunk,
+                   est=est if split else est[0])
 
 
 @torch.no_grad()
@@ -331,7 +378,7 @@ def rtn_dq(weight: torch.Tensor, step: torch.Tensor, device="cuda", lam: float =
             i2 = min(i1 + blocksize, in_f)
             if i1 % chunk == 0:
                 state = torch.zeros(r1 - r0, dtype=torch.long, device=device)
-            nb, state = _viterbi_block(W[r0:r1, i1:i2], s_row[r0:r1], hcol[i1:i2], None, state, tabs, feedback=False)
+            nb, state, _ = _viterbi_block(W[r0:r1, i1:i2], s_row[r0:r1], hcol[i1:i2], None, state, tabs, feedback=False)
             codes[r0:r1, i1:i2] = nb.to(torch.int8).cpu()
     return UResult(codes, step.float().cpu(), dq=True, perm=None, chunk=chunk)
 
