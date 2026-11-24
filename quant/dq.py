@@ -382,6 +382,14 @@ def rate_tables(codes: torch.Tensor, perm: torch.Tensor | None, smooth: float = 
     return bits, cls
 
 
+def rate_model(weight: torch.Tensor, step: torch.Tensor, device, cols: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rate tables for the trellis search: (row class, state) statistics of the trellis RTN codes on the same grid,
+    from the first `cols` columns only (None = all; the statistics need far fewer columns than the search)."""
+    w = weight if cols is None else weight[:, :cols]
+    u = rtn_dq(w, step, device=device)
+    return rate_tables(u.codes, None, chunk=u.chunk)
+
+
 def ideal_bits(codes: torch.Tensor, perm: torch.Tensor | None, per_state: bool = True, chunk: int | None = None) -> float:
     """Empirical conditional entropy (bits) of the tensor's indices given (row class, state) or (row class, quantiser)."""
     ct = codes if perm is None else codes[:, perm]

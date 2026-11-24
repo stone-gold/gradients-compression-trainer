@@ -824,7 +824,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 d = dq_step(w, st, col)
                 kw = {}
                 if dq_lam > 0:  # rate model: per (row class, state) tables of the trellis RTN codes on the same grid
-                    bits, cls = dq.rate_tables(dq.rtn_dq(w[:, :dq_rate_cols], d, device=H.device).codes, None)
+                    bits, cls = dq.rate_model(w, d, H.device, dq_rate_cols)
                     kw = {"lam": dq_lam, "bits": bits, "cls": cls}
                 return dq.gptq_dq(w, H, d, damp=damp, blocksize=dq_block, act_order=dq_order if act else False, col=col, **kw)
             return ecq.gptq_u(w, H, st, damp=damp, act_order=act, col=col, rdo=rdo)
@@ -839,7 +839,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 d = torch.cat([dq_step(w, steps[n]) for n, w in zip(names, ws)])
                 kw = {}
                 if dq_lam > 0:
-                    bits, cls = dq.rate_tables(dq.rtn_dq(wcat[:, :dq_rate_cols], d, device=H.device).codes, None)
+                    bits, cls = dq.rate_model(wcat, d, H.device, dq_rate_cols)
                     kw = {"lam": dq_lam, "bits": bits, "cls": cls}
                 u = dq.gptq_dq(wcat, H, d, damp=damp, blocksize=dq_block, act_order=dq_order, **kw)
                 out, r0 = [], 0

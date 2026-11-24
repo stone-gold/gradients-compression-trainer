@@ -37,7 +37,7 @@ for hk, ns in groups.items():
     wcat, d = torch.cat(ws, 0), torch.cat(steps)
     kw = {}
     if lam > 0:
-        bits, cls = dq.rate_tables(dq.rtn_dq(wcat, d, device="cpu").codes, None)
+        bits, cls = dq.rate_model(wcat, d, "cpu", 512)
         kw = {"lam": lam, "bits": bits, "cls": cls}
     t0 = time.time()
     u = dq.gptq_dq(wcat, data[hk].float(), d, act_order="b16", **kw)

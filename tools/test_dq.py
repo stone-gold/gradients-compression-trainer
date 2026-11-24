@@ -62,7 +62,7 @@ for name, R, C, kind in [("one", 1, 1, "rtn"), ("tiny", 3, 7, "rtn"), ("odd", 25
         kw = {}
         if kind == "gptq_rate":
             u0 = dq.rtn_dq(w, step, device="cpu")
-            bits, cls = dq.rate_tables(u0.codes, None)
+            bits, cls = dq.rate_tables(u0.codes, None, chunk=u0.chunk)
             kw = {"lam": 0.1, "bits": bits, "cls": cls}
         if kind == "gptq_col":
             kw["col"] = ecq.column_factors(H, 0.5, 4.0)
