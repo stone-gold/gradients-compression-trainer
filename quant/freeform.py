@@ -559,7 +559,14 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         f_len = int(os.environ.get("QUANT_ECQ_FISHER_LEN", 2048))
         f_secs = float(os.environ.get("QUANT_ECQ_FISHER_SECONDS", 180))
         frows = [r for r in pool if r.n_scored > 0][-int(os.environ.get("QUANT_ECQ_FISHER_ROWS", 512)) :]
-        fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), f_len, seconds=f_secs)
+        try:
+            fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), f_len, seconds=f_secs)
+        except Exception as exc:  # noqa: BLE001 - e.g. out of memory on whole 2048-token rows: the 864ff23 setting
+            log.warning("Fisher on %d whole rows failed (%r): retrying with 128 rows cut at 1024 tokens", len(frows), exc)
+            gc.collect()
+            torch.cuda.empty_cache()
+            frows = frows[-128:]
+            fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), 1024)
         torch.cuda.empty_cache()
         log.info("Fisher in %.0fs", time.time() - t0)
         if os.environ.get("QUANT_ECQ_FISHER_CALIB", "0") == "1" and calib and len(eval_rows) >= 64:
@@ -1267,6 +1274,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             group_quantizer=group_quantizer if (use_dq or os.environ.get("QUANT_ECQ_GROUP_GPTQ", "0") == "1") else None,
         )
         lin = {n: q for n, q in lin.items() if n in base.shapes and not is_embed_like(n)}
+        t_gptq = time.time() - t0  # the GPTQ pass of this probe alone (the land6 row scans are sized against it)
         for n in names_2d:
             if n not in lin:
                 lin[n] = q_emb(n, steps[n])
@@ -1371,8 +1379,13 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 # to price the input-side error of a coarser step, so the scan stays inside the range E1 measured.
                 u_opts = [1.0] + [float(x) for x in os.environ.get("QUANT_FF_EMB_UNSEEN_U", "1.5,2").split(",") if x]
                 r, sigma, q_e = row_scan("EMBUNSEEN (%s rows)" % ",".join(str(int(m_.sum())) for m_ in unseen.values()), u_opts, set_u, (r, sigma, q_e))
+            # the soft-trim and rare-row scans (3 evals each + GPTQ of the rows) run only while two more GPTQ probes still fit
+            # after them with the usual reserve: on a large model or a short budget the run then behaves as 864ff23 did
+            scan_ok = deadline.left() > 2.0 * t_gptq + 1200 + dq_reserve
+            if not scan_ok:
+                log.info("EMBSOFT / EMBRARE scans skipped (%.0fs left, GPTQ pass %.0fs)", deadline.left(), t_gptq)
             soft_names = [n_ for n_ in trimmed if n_ in emb_gptq and n_ in q_e]
-            if soft_names and os.environ.get("QUANT_FF_EMB_SOFT", "1") == "1" and deadline.left() > 1200 + dq_reserve:
+            if soft_names and os.environ.get("QUANT_FF_EMB_SOFT", "1") == "1" and scan_ok:
                 # soft trim (the trim was kept): the trimmed rows of the head table from their original values, GPTQ against
                 # head_H, at step = S x the rms of those rows; "trim" (the mean row) stays an option
                 gp0 = {n_: emb_gptq[n_].clone() for n_ in soft_names}
@@ -1401,7 +1414,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                             rare_base0[n_] = alloc.base[n_].clone()
                 s_opts = ["trim"] + [float(x) for x in os.environ.get("QUANT_FF_EMB_SOFT_S", "2,2.8,4").split(",") if x]
                 r, sigma, q_e = row_scan("EMBSOFT (%s rows)" % ",".join(str(int(trimmed[n_].sum())) for n_ in soft_names), s_opts, set_soft, (r, sigma, q_e))
-            if rare and any(bool(m_.any()) for m_ in rare.values()) and os.environ.get("QUANT_FF_EMB_RARE", "1") == "1" and deadline.left() > 1200 + dq_reserve:
+            if rare and any(bool(m_.any()) for m_ in rare.values()) and os.environ.get("QUANT_FF_EMB_RARE", "1") == "1" and scan_ok:
                 # rare-row step factor (GPTQ rows): lever E1's idea for the rows seen 1..QUANT_FF_EMB_RARE_MAX times
                 def set_rare(x_):
                     for n_, m_ in rare.items():
