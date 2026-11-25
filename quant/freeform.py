@@ -895,7 +895,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         b = [y for x, y in zip(rl, ref) if x == x and y == y]
         return sum(a) / max(1e-12, sum(b))
 
-    def block_pick(fin: dict) -> None:
+    def block_pick(fin: dict):
         nonlocal eval_t
         t_all = time.time()
         st = fin["steps"]
@@ -955,7 +955,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         for b in sorted({unit_of(n) for n in names if unit_of(n) >= 0}):
             if deadline.left() < 400 + dq_reserve:
                 log.info("BLOCKPICK: out of time at block %d", b)
-                return
+                return None
             ns = [n for n in names if unit_of(n) == b]
             set_weights(model, {n: lin_b[n] for n in ns}, 0)
             re_ = even_r()
@@ -964,18 +964,58 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 pick.append(b)
             log.info("BLOCKPICK block %d: even-row dr %+.5f", b, re_ - ra_e)
         if not pick:
-            return
+            return None
         comb = {n: (lin_b[n] if unit_of(n) in pick else lin_a[n]) for n in names_2d}
         set_weights(model, {n: comb[n] for n in names}, 0)
         rc_all, rc_e, rc_o = split_r()
         log.info("BLOCKPICK combined (%d blocks from B): r %.4f even %.4f odd %.4f (A odd %.4f): %s", len(pick), rc_all, rc_e, rc_o, ra_o,
                  "accepted" if rc_o < ra_o else "rejected")
         if rc_o >= ra_o:
-            return
+            return None
         r_, sigma_ = measure()
         entries = [ffcodec.Entry(name, shape, q=comb[name]) if name in comb else ffcodec.Entry(name, shape, tensor=base.tensor(name))
                    for name, shape in base.shapes.items()]
         consider(fin["name"] + f"-pick{len(pick)}", entries, r_ + bias, sigma=sigma_)
+        return comb, r_
+
+    def gptq_at(st: dict, smp: list) -> dict:
+        """One GPTQ(+DQ) pass at the given per-tensor scalar steps (same quantisers as a probe); embeddings stay out."""
+        restore()
+
+        def qz(name, w, H):
+            if H is None:
+                return rtn_lin(name, w, st[name])
+            act = os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1"
+            if use_dq and not is_embed_like(name):
+                d = dq_step(w, st[name])
+                kw = {}
+                if dq_lam > 0:
+                    bits, cls = dq.rate_model(w, d, H.device, dq_rate_cols)
+                    kw = {"lam": dq_lam, "bits": bits, "cls": cls}
+                return dq.gptq_dq(w, H, d, damp=damp, blocksize=dq_block, act_order=dq_order if act else False, **kw)
+            return ecq.gptq_u(w, H, st[name], damp=damp, act_order=act, rdo=rdo)
+
+        def gqz(names, ws, H):
+            if use_dq and not any(is_embed_like(n) for n in names):
+                sizes = [w.shape[0] for w in ws]
+                wcat = torch.cat(ws, 0)
+                d = torch.cat([dq_step(w, st[n]) for n, w in zip(names, ws)])
+                kw = {}
+                if dq_lam > 0:
+                    bits, cls = dq.rate_model(wcat, d, H.device, dq_rate_cols)
+                    kw = {"lam": dq_lam, "bits": bits, "cls": cls}
+                u = dq.gptq_dq(wcat, H, d, damp=damp, blocksize=dq_block, act_order=dq_order, split=sizes, **kw)
+                out, r0 = [], 0
+                for i, sz in enumerate(sizes):
+                    out.append(ecq.UResult(u.codes[r0 : r0 + sz].contiguous(), u.step[r0 : r0 + sz].contiguous(), dq=True, perm=u.perm, okey=u.okey,
+                                           chunk=u.chunk, est=u.est[i]))
+                    r0 += sz
+                return out
+            return [qz(n, w, H) for n, w in zip(names, ws)]
+
+        out = quantize_model_gptq(model, smp, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300,
+                                  quantizer=qz, group_quantizer=gqz if use_dq else None)
+        return {n: q for n, q in out.items() if n in base.shapes and not is_embed_like(n)}
 
     def block_realloc(lo: dict, hi: dict) -> bool:
         os.environ["QUANT_FF_UNIT_SWAP_SETS"] = "blocks"
@@ -1266,11 +1306,60 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             log.info("PICKOVER: over-aim mix %d/%d units, r %.4f (target %.4f)", m, len(units), r_o, r_t)
             fin_over = {"lin": lin_o, "r": r_o, "name": f"ecq-over-c{lo['c']:.4g}-c{hi['c']:.4g}-m{m}of{len(units)}",
                         "steps": {n: src_of[n]["steps"][n] for n in names_2d}}
+            res_p = None
             try:
-                block_pick(fin_over)
+                res_p = block_pick(fin_over)
                 picked_over = True
             except Exception as exc:  # noqa: BLE001
                 log.warning("pick over failed: %r", exc)
+            # lever 2c v3 (QUANT_FF_PICK_RELAND=1): the pick lowers r (t15 25 Nov: 1.0351 -> 1.0262 cal, 1.0246 test) but the
+            # over-aim mix can only reach the hi probe; re-land: one GPTQ probe coarser than hi (secant, slope prior 2, at most
+            # 1.5x), then a linear-unit mix between the picked model (lo side) and that probe, each mix point a candidate
+            if res_p is not None and os.environ.get("QUANT_FF_PICK_RELAND", "0") == "1":
+                comb_p, r_p = res_p
+                if r_p < aim - 0.002 and deadline.left() > (probe_time or 300) * 1.25 + 6 * 45 + 330 + dq_reserve:
+                    try:
+                        t_rl = time.time()
+                        c_ref = hi["c"]
+                        c_new = c_ref * math.exp((math.log(max(aim + 0.004 - 1.0, 1e-5)) - math.log(max(r_p - 1.0, 1e-5))) / 2.0)
+                        c_new = min(c_ref * 1.5, max(c_ref * 1.05, c_new))
+                        st_new = alloc.steps(c_new)
+                        lin_h = gptq_at(st_new, samples)
+                        for n in names_2d:
+                            if n not in lin_h:
+                                lin_h[n] = comb_p[n] if is_embed_like(n) else ecq.rtn_u(base.tensor(n), st_new[n], device=device)
+                        set_weights(model, {n: lin_h[n] for n in names_2d if n in params}, 0)
+                        r_h, s_h = measure()
+                        ents = [ffcodec.Entry(name, shape, q=lin_h[name]) if name in lin_h else ffcodec.Entry(name, shape, tensor=base.tensor(name))
+                                for name, shape in base.shapes.items()]
+                        consider(f"ecq-reland-c{c_new:.4g}", ents, r_h + bias, sigma=s_h)
+                        del ents
+                        log.info("PICKRELAND: probe c %.4g r %.4f (picked r %.4f, aim %.4f), %.0fs", c_new, r_h, r_p, aim, time.time() - t_rl)
+                        if r_h > aim:
+                            u_lo, u_rlo, u_hi, u_rhi = 0, r_p, len(units), r_h
+                            for j in range(6):
+                                if u_hi - u_lo <= 1 or deadline.left() < 240 + dq_reserve:
+                                    break
+                                frac = (aim - u_rlo) / max(1e-9, u_rhi - u_rlo)
+                                m2 = min(u_hi - 1, max(u_lo + 1, int(round(u_lo + frac * (u_hi - u_lo)))))
+                                fh = set(units[:m2])
+                                mixl = {n: (lin_h[n] if unit_of_name[n] in fh else comb_p[n]) for n in names_2d}
+                                set_weights(model, {n: mixl[n] for n in names_2d if n in params}, 0)
+                                r_m, s_m = measure()
+                                ents = [ffcodec.Entry(name, shape, q=mixl[name]) if name in mixl else ffcodec.Entry(name, shape, tensor=base.tensor(name))
+                                        for name, shape in base.shapes.items()]
+                                _, _, est_m = consider(f"ecq-reland-mix-m{m2}of{len(units)}", ents, r_m + bias, sigma=s_m)
+                                del ents, mixl
+                                log.info("PICKRELAND mix %d: %d/%d units from the coarse probe, r %.4f, ~%.1f MB", j, m2, len(units), r_m, est_m / 1e6)
+                                if r_m <= aim:
+                                    u_lo, u_rlo = m2, r_m
+                                else:
+                                    u_hi, u_rhi = m2, r_m
+                                if abs(r_m - aim) <= tol_mix:
+                                    break
+                        del lin_h
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("pick re-land failed: %r", exc)
             del fin_over, lin_o
     keep.clear()
     gc.collect()
