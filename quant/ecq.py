@@ -139,10 +139,14 @@ def gptq_u(weight: torch.Tensor, H: torch.Tensor, step: torch.Tensor, damp: floa
     return UResult(codes.cpu(), step.float().cpu(), None if col is None else col.float().cpu())
 
 
-def fisher_rows(model, rows, names: list[str], n_rows: int, max_len: int) -> dict[str, torch.Tensor]:
+def fisher_rows(model, rows, names: list[str], n_rows: int, max_len: int, seconds: float | None = None) -> dict[str, torch.Tensor]:
     """Empirical Fisher per output row: mean over rows of sum_j (dL/dW_ij)^2, L = the row's mean supervised CE.
 
-    Returns {name: fp32 [out] on CPU}, the per-weight mean (divided by in_features)."""
+    Returns {name: fp32 [out] on CPU}, the per-weight mean (divided by in_features). seconds: stop early once this much
+    time is used and at least 64 rows are in (large models: the row count adapts to the budget)."""
+    import time as _time
+
+    t_end = None if seconds is None else _time.time() + seconds
     params = dict(model.named_parameters())
     targets = {n: params[n] for n in names if n in params}
     flags = {n: p.requires_grad for n, p in params.items()}
@@ -155,7 +159,7 @@ def fisher_rows(model, rows, names: list[str], n_rows: int, max_len: int) -> dic
     used = 0
     try:
         for row in rows:
-            if used >= n_rows:
+            if used >= n_rows or (t_end is not None and used >= 64 and _time.time() > t_end):
                 break
             ids = torch.tensor(row.input_ids[:max_len], device=device).view(1, -1)
             labels = torch.tensor(row.labels[:max_len], device=device)
@@ -185,7 +189,9 @@ class Allocation:
     """step[name] = c * base[name]; base from Fisher (step ~ 1/sqrt(f)) or from the weights' RMS (uniform bits)."""
 
     def __init__(self, shapes: dict[str, list[int]], weights_rms: dict[str, torch.Tensor], fisher: dict[str, torch.Tensor] | None,
-                 row_level: set[str], row_clamp: float | dict = 4.0):
+                 row_level: set[str], row_clamp: float | dict = 4.0, tensor_level: dict[str, float] | None = None):
+        """tensor_level: optional {name: mean Fisher} replacing each tensor's own mean (the row factors inside a tensor
+        still come from `fisher`): the level can be measured on other rows than the row shape."""
         self.base: dict[str, torch.Tensor] = {}
         self.numel = {n: math.prod(shapes[n]) for n in weights_rms}
         if fisher is None:
@@ -197,10 +203,13 @@ class Allocation:
         tensor_f = {n: float(f.mean()) for n, f in fisher.items()}
         positive = sorted(v for v in tensor_f.values() if v > 0)
         floor = positive[len(positive) // 2] * 1e-4 if positive else 1.0
+        level = dict(tensor_f)
+        if tensor_level:
+            level.update({n: v for n, v in tensor_level.items() if n in tensor_f and v > 0 and tensor_f[n] > 0})
         for n in weights_rms:
             f = fisher.get(n)
             ft = max(tensor_f.get(n, 0.0), floor)
-            b = torch.full((shapes[n][0],), 1.0 / math.sqrt(ft))
+            b = torch.full((shapes[n][0],), 1.0 / math.sqrt(max(level.get(n, 0.0), floor)))
             if f is not None and n in row_level:
                 rc = row_clamp.get(n, 4.0) if isinstance(row_clamp, dict) else row_clamp
                 rel = (ft / f.clamp(min=ft * 1e-6)).sqrt().clamp(1.0 / rc, rc)

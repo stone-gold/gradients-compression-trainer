@@ -219,6 +219,118 @@ def capture_layer_inputs(model, layers, samples: list[torch.Tensor], device):
     return store
 
 
+def position_saliency(model, rows, max_len: int = 2048, power: float = 1.0, floor: float = 0.0, cap: float = 0.0,
+                      seconds: float | None = None) -> tuple[dict[str, list[torch.Tensor]], dict]:
+    """Loss-aware token weights for the GPTQ Hessians (GuidedQuant, Kim et al. 2025, arXiv:2505.07004, with one group
+    per layer): for every decoder Linear and every token t of every row, s_t = mean over output channels of
+    (dL/dz_t)^2, z = the module's output, L = the row's mean supervised CE on the unquantised model. The layer-wise
+    objective sum_t s_t |dW x_t|^2 is the second-order loss change of a weight error dW, where plain GPTQ weighs all
+    tokens alike (prompt tokens, 93% of the tokens on a long-prompt task, as much as the scored ones).
+    Weights: w_t = s_t^power / mean, mixed as floor + (1 - floor) w, capped at `cap` x mean (0 = no cap); Linears that
+    read the same input (q/k/v, gate/up) share the mean of their weights, so the stacked GPTQ pass keeps one Hessian.
+    rows: quant.data.Row in the order of the GPTQ samples. Returns ({module name: [fp32 [tokens] per row]}, stats);
+    a row cut by max_len or without a scored token gets uniform weights (None entries are filled with ones)."""
+    import time as _time
+
+    from quant.data import IGNORE_INDEX
+
+    t_end = None if seconds is None else _time.time() + seconds
+    device = next(model.parameters()).device
+    layers = decoder_layers(model)
+    names = module_names(model)
+    mods = {names[id(m)]: m for layer in layers for m in layer.modules() if isinstance(m, nn.Linear)}
+    raw: dict[str, list] = {n: [] for n in mods}
+    in_ptr: dict[str, int] = {}
+    grads: dict[str, torch.Tensor] = {}
+    handles = []
+    for n, m in mods.items():
+        def fwd(_m, inp, _out, n=n):
+            in_ptr[n] = inp[0].data_ptr()
+
+        def bwd(_m, _gin, gout, n=n):
+            grads[n] = gout[0].detach().float().pow(2).mean(-1).reshape(-1).cpu()
+
+        handles.append(m.register_forward_hook(fwd))
+        handles.append(m.register_full_backward_hook(bwd))
+    emb = model.get_input_embeddings()
+    groups: dict[str, str] = {}
+    done = 0
+    flags = {n: p.requires_grad for n, p in model.named_parameters()}
+    for p in model.parameters():  # only the activations need gradients (the input embeddings carry requires_grad)
+        p.requires_grad_(False)
+    try:
+        with torch.enable_grad():
+            for row in rows:
+                ok = len(row.input_ids) <= max_len and (t_end is None or _time.time() <= t_end)
+                tg = torch.tensor(row.labels, device=device)[1:]
+                mask = tg != IGNORE_INDEX
+                if not ok or not bool(mask.any()):
+                    for n in raw:
+                        raw[n].append(None)
+                    continue
+                ids = torch.tensor(row.input_ids, device=device).view(1, -1)
+                x = emb(ids).detach().requires_grad_(True)
+                logits = model(inputs_embeds=x, use_cache=False).logits[0, :-1].float()
+                loss = torch.nn.functional.cross_entropy(logits[mask], tg[mask])
+                grads.clear()
+                loss.backward()
+                if not groups:  # modules reading the same input tensor (same layer): one weight vector for the stage
+                    by_ptr: dict[int, list[str]] = {}
+                    for n, ptr in in_ptr.items():
+                        by_ptr.setdefault(ptr, []).append(n)
+                    for members in by_ptr.values():
+                        for n in members:
+                            groups[n] = members[0]
+                for n in raw:
+                    raw[n].append(grads.get(n))
+                done += 1
+                del logits, loss, x
+    finally:
+        for h in handles:
+            h.remove()
+        for n, p in model.named_parameters():
+            p.grad = None
+            p.requires_grad_(flags[n])
+    out: dict[str, list[torch.Tensor]] = {}
+    norm: dict[str, list] = {}
+    for n, lst in raw.items():
+        got = [g for g in lst if g is not None]
+        if not got:
+            continue
+        tot = sum(float(g.pow(power).sum()) if power != 1.0 else float(g.sum()) for g in got)
+        cnt = sum(g.numel() for g in got)
+        mean = max(tot / max(1, cnt), 1e-30)
+        norm[n] = [None if g is None else (g.pow(power) if power != 1.0 else g) / mean for g in lst]
+    members: dict[str, list[str]] = {}
+    for n in norm:
+        members.setdefault(groups.get(n, n), []).append(n)
+    ess = []
+    for lead, ms in members.items():
+        merged = []
+        for i in range(len(rows)):
+            parts = [norm[m][i] for m in ms if norm[m][i] is not None]
+            if not parts:
+                merged.append(None)
+                continue
+            w = sum(parts) / len(parts)
+            if cap > 0:
+                w = w.clamp(max=cap)
+            merged.append(floor + (1.0 - floor) * w)
+        got = [w for w in merged if w is not None]
+        s1 = sum(float(w.sum()) for w in got)
+        s2 = sum(float(w.pow(2).sum()) for w in got)
+        nt = sum(w.numel() for w in got)
+        ess.append(s1 * s1 / max(s2, 1e-30) / max(1, nt))
+        # renormalise to mean 1 over the weighted rows; rows without weights run with ones (quantize_model_gptq)
+        k = nt / max(s1, 1e-30)
+        merged = [None if w is None else w * k for w in merged]
+        for m in ms:
+            out[m] = [w if w is not None else torch.ones(len(rows[i].input_ids)) for i, w in enumerate(merged)]
+    stats = {"rows": done, "modules": len(out), "ess_min": min(ess) if ess else 0.0, "ess_median": sorted(ess)[len(ess) // 2] if ess else 0.0,
+             "ess_max": max(ess) if ess else 0.0}
+    return out, stats
+
+
 def _layer_out(out):
     return out[0] if isinstance(out, (tuple, list)) else out
 
@@ -238,8 +350,12 @@ def quantize_model_gptq(
     time_left=lambda: float("inf"),
     quantizer=None,
     group_quantizer=None,
+    pos_weights: dict[str, list[torch.Tensor]] | None = None,
 ) -> dict[str, QResult]:
     """Sequential GPTQ: each layer sees the outputs of the already-quantised layers before it.
+
+    pos_weights: optional {module name: [per sample: fp32 [tokens] weights]} (position_saliency): each token's input
+    row enters the module's Hessian with that weight (mean ~1), H = sum_t w_t x_t x_t^T instead of X^T X.
 
     The model must sit on one CUDA device. Weights of quantised Linears are replaced in place by their dequantised
     values. Returns {checkpoint weight name: QResult}. Falls back to RTN for the remaining layers if time runs short.
@@ -254,6 +370,7 @@ def quantize_model_gptq(
     hiddens = [s[0] for s in store]
     results: dict[str, QResult] = {}
     use_rtn = False
+    cur = [0]  # index of the sample running through the layer (for pos_weights)
     for li, layer in enumerate(layers):
         tl = time.time()
         linears = {
@@ -285,9 +402,15 @@ def quantize_model_gptq(
                     if use_rtn:
                         return
                     x2 = x.reshape(-1, x.shape[-1]).float()
+                    pw = None if pos_weights is None else pos_weights.get(name)
+                    if pw is not None and cur[0] < len(pw) and pw[cur[0]].numel() == x2.shape[0]:
+                        wt = pw[cur[0]].to(device=x2.device, dtype=torch.float32)
+                        x2 = x2 * wt.sqrt().unsqueeze(1)
+                        counts[name] += float(wt.sum())
+                    else:
+                        counts[name] += x2.shape[0]
                     h = x2.t().matmul(x2)
                     Hs[name] = h if Hs[name] is None else Hs[name].add_(h)
-                    counts[name] += x2.shape[0]
 
                 return hook
 
@@ -296,6 +419,7 @@ def quantize_model_gptq(
                     handles.append(m.register_forward_hook(make_hook(n)))
                 try:
                     for i, (_h0, args, kwargs) in enumerate(store):
+                        cur[0] = i
                         run_layer(layer, hiddens[i], args, kwargs)
                 finally:
                     for h in handles:

@@ -43,6 +43,7 @@ log = logging.getLogger("quant.freeform")
 EMBED_MARKERS = ("embed_tokens", "wte", "word_embeddings")
 LM_HEAD = "lm_head.weight"
 HF_GITATTRIBUTES_BYTES = 1519  # the .gitattributes Hugging Face adds to a new repo; counted in total_bytes
+SPECIAL_COUNT = 1 << 30  # train-split count given to special / added tokens (always "frequent")
 
 
 class BaseTensors:
@@ -226,10 +227,12 @@ def tune_candidate(model, lin: dict, train_rows, sel_rows, budget_s: float, pad_
     return raw
 
 
-def used_token_ids(task_id: str, dataset_arg: str, tok, extra_rows, time_limit: float) -> set[int] | None:
+def used_token_ids(task_id: str, dataset_arg: str, tok, extra_rows, time_limit: float) -> dict[int, int] | None:
     """Token ids that occur anywhere in the task's train split (every string field of every row, tokenised in batches by
     the fast tokenizer), in the calibration rows and in the tokenizer's special / added tokens. None if the split cannot
-    be read completely within time_limit (then nothing is trimmed)."""
+    be read completely within time_limit (then nothing is trimmed). Returned as {id: occurrences in the train split};
+    special / added tokens count as frequent (SPECIAL_COUNT)."""
+    import collections
     import itertools
 
     t_end = time.time() + time_limit
@@ -251,7 +254,7 @@ def used_token_ids(task_id: str, dataset_arg: str, tok, extra_rows, time_limit: 
             for v in x:
                 yield from strings(v)
 
-    used: set[int] = set()
+    used: collections.Counter = collections.Counter()
     it = iter(rows)
     while True:
         chunk = list(itertools.islice(it, 512))
@@ -265,13 +268,47 @@ def used_token_ids(task_id: str, dataset_arg: str, tok, extra_rows, time_limit: 
             used.update(ids)
     for r in extra_rows:
         used.update(r.input_ids)
-    used.update(int(i) for i in (tok.all_special_ids or []))
-    used.update(int(i) for i in getattr(tok, "added_tokens_decoder", {}).keys())
+    special = {int(i) for i in (tok.all_special_ids or [])} | {int(i) for i in getattr(tok, "added_tokens_decoder", {}).keys()}
     for t in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"):
         v = getattr(tok, t, None)
         if v is not None:
-            used.add(int(v))
-    return used
+            special.add(int(v))
+    for i in special:
+        used[i] = max(used[i], SPECIAL_COUNT)
+    return dict(used)
+
+
+@torch.no_grad()
+def head_hessian(model, rows, max_rows: int = 256) -> torch.Tensor | None:
+    """E[h h^T] (fp32 [d, d] on the model's device) over the inputs of the output embedding (LM head) at the scored
+    positions of `rows`: the metric of a head row's quantisation error d is d^T H d (the variance of its logit error)."""
+    from quant.fixed import IGNORE_INDEX
+
+    head = model.get_output_embeddings()
+    if head is None:
+        return None
+    device = next(model.parameters()).device
+    got = []
+    handle = head.register_forward_pre_hook(lambda _m, inp: got.append(inp[0].detach()))
+    H, n = None, 0
+    try:
+        for row in rows[:max_rows]:
+            ids = torch.tensor(row.input_ids, device=device).view(1, -1)
+            mask = torch.tensor(row.labels, device=device)[1:] != IGNORE_INDEX
+            if not bool(mask.any()):
+                continue
+            got.clear()
+            model(input_ids=ids, use_cache=False)
+            if not got:
+                continue
+            x = got[-1].reshape(-1, got[-1].shape[-1])[:-1][mask].double()
+            H = x.t().matmul(x) if H is None else H.add_(x.t().matmul(x))
+            n += x.shape[0]
+    finally:
+        handle.remove()
+    if H is None or n < 2 * H.shape[0]:
+        return None
+    return (H / n).float()
 
 
 def final_rans(args, out, best: dict, deadline, level: int, base) -> None:
@@ -506,16 +543,45 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     alloc_kind = os.environ.get("QUANT_ECQ_ALLOC", "fisher_row")
     log.info("ECQ alloc %s", alloc_kind)
     fisher = None
+    tensor_level = None
     if alloc_kind.startswith("fisher"):
         t0 = time.time()
-        frows = [r for r in pool if r.n_scored > 0][-int(os.environ.get("QUANT_ECQ_FISHER_ROWS", 128)) :]
-        fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), int(os.environ.get("QUANT_ECQ_FISHER_LEN", 1024)))
+        # lever F (land6): the Fisher that shapes the step allocation was the weakest estimate of the pipeline. (a) rows were cut
+        # at 1024 tokens and a row with no scored token before the cut was dropped: t23 (prompts ~1430 tokens, as the R1 task)
+        # used 57 of 128 rows, and only their head; (b) 128 rows leave a log-step noise of sd ~0.19 per row (t15: two
+        # disjoint 128-row sets differ by sd 0.27), ~0.05 bit per weight by the high-rate rule; (c) the input model was
+        # fine-tuned on the train split (t15 bf16 loss 0.90 on train rows vs 1.51 on calibration rows), and the train-row
+        # Fisher puts the early blocks 20-30% too coarse and the late blocks 5-20% too fine against held-out rows.
+        # Now: QUANT_ECQ_FISHER_ROWS (512) whole rows (QUANT_ECQ_FISHER_LEN 2048), bounded by QUANT_ECQ_FISHER_SECONDS.
+        # QUANT_ECQ_FISHER_CALIB=1 (OFF: each tensor's LEVEL (mean Fisher) from calibration rows, row shape from the train
+        # rows) lost the RTN equal-r test on the t15 test rows (+0.4..+1.3% bytes vs the train level; 1024 train rows
+        # alone: -2.0..+0.2%), so (c) stays unused.
+        f_len = int(os.environ.get("QUANT_ECQ_FISHER_LEN", 2048))
+        f_secs = float(os.environ.get("QUANT_ECQ_FISHER_SECONDS", 180))
+        frows = [r for r in pool if r.n_scored > 0][-int(os.environ.get("QUANT_ECQ_FISHER_ROWS", 512)) :]
+        fisher = ecq.fisher_rows(model, frows, names_2d, len(frows), f_len, seconds=f_secs)
         torch.cuda.empty_cache()
         log.info("Fisher in %.0fs", time.time() - t0)
+        if os.environ.get("QUANT_ECQ_FISHER_CALIB", "0") == "1" and calib and len(eval_rows) >= 64:
+            t0 = time.time()
+            crows = eval_rows[: int(os.environ.get("QUANT_ECQ_FISHER_CALIB_ROWS", 256))]
+            f_cal = ecq.fisher_rows(model, crows, names_2d, len(crows), f_len, seconds=f_secs / 2)
+            mix = float(os.environ.get("QUANT_ECQ_FISHER_CALIB_MIX", 1.0))  # 1 = calibration level, 0 = train level (log scale)
+            tensor_level = {}
+            for n, f in f_cal.items():
+                a, b = float(f.mean()), float(fisher[n].mean()) if n in fisher else 0.0
+                if a > 0 and b > 0:
+                    tensor_level[n] = math.exp(mix * math.log(a) + (1.0 - mix) * math.log(b))
+            sh = sorted(0.5 * math.log(float(fisher[n].mean()) / v) for n, v in tensor_level.items())
+            if sh:
+                log.info("Fisher level from %d calibration rows in %.0fs: log step shift vs train level min %.2f median %.2f max %.2f (mix %.2f)",
+                         len(crows), time.time() - t0, sh[0] - sh[len(sh) // 2], 0.0, sh[-1] - sh[len(sh) // 2], mix)
+            del f_cal
+            torch.cuda.empty_cache()
     embed_row = os.environ.get("QUANT_ECQ_EMBED_ROW", "1") == "1"
     row_level = set() if alloc_kind != "fisher_row" else {n for n in names_2d if embed_row or n not in embed_names}
     clamp = {n: float(os.environ.get("QUANT_ECQ_EMBED_CLAMP" if n in embed_names else "QUANT_ECQ_ROW_CLAMP", 4.0)) for n in names_2d}
-    alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, clamp)
+    alloc = ecq.Allocation(base.shapes, rms, fisher, row_level, clamp, tensor_level=tensor_level)
     alloc.set_floor({n: base.tensor(n).float().abs().amax(1) for n in names_2d}, float(os.environ.get("QUANT_ECQ_MAX_CODE", 100)))
     # Vocabulary trim (QUANT_FF_VOCAB_TRIM=1): embedding / head rows of tokens that never occur in the task's data are
     # quantised to zero (step far above the row's range): an input row that is never looked up costs nothing, and a zero
@@ -528,6 +594,9 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # unseen-token misses at the rate the scored rows will.
     unseen: dict[str, torch.Tensor] = {}
     unseen_base0: dict[str, torch.Tensor] = {}
+    used = None
+    trimmed: dict[str, torch.Tensor] = {}  # name -> rows replaced by the mean row (trim kept)
+    trim_state: dict[str, dict] = {}  # name -> what the kept trim set (override, base, floor) and the untrimmed values
     if os.environ.get("QUANT_FF_VOCAB_TRIM", "1") == "1" and embed_names:
         t0 = time.time()
         used = used_token_ids(args.task_id, args.dataset, tok, [], float(os.environ.get("QUANT_FF_VOCAB_SECONDS", 240)))
@@ -561,9 +630,12 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 base.overrides = {n: w for n, (mask, w) in plan.items()}
                 for n, (mask, w) in plan.items():
                     shared = alloc.base[n][~mask].median()
+                    trim_state[n] = {"base0": alloc.base[n].clone(), "floor0": alloc.floor[n].clone() if n in alloc.floor else None}
                     alloc.base[n] = torch.where(mask, shared.expand_as(alloc.base[n]), alloc.base[n])
                     if n in alloc.floor:
                         alloc.floor[n] = torch.where(mask, alloc.floor[n][mask].max().expand_as(alloc.floor[n]), alloc.floor[n])
+                    trimmed[n] = mask
+                    trim_state[n].update(over=w, base=alloc.base[n].clone(), floor=alloc.floor[n].clone() if n in alloc.floor else None)
             else:
                 for n in plan:
                     params[n].data.copy_(base.tensor(n).to(params[n].dtype).to(params[n].device))
@@ -575,6 +647,63 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 if os.environ.get("QUANT_FF_EMB_UNSEEN", "1") == "1":
                     unseen = {n: m for n, (m, _) in plan.items()}
                     unseen_base0 = {n: alloc.base[n].clone() for n in unseen}
+
+    # lever E2 (land6, QUANT_FF_EMB_GPTQ=1): rows of the output embedding (the tied table, or an untied lm_head) can be
+    # quantised by GPTQ against the head's input second moment H = E[h h^T] (final hidden states at scored positions)
+    # instead of RTN. H is very anisotropic (26 Nov: effective rank 4.5 on t15, 7.5 on t23, 23 on t05), so error feedback
+    # cuts a row's logit error variance d^T H d 4-7x at the same step. Measured on the shipped 864ff23 artifacts, r on the
+    # calibration rows: it pays where rows can then take a much coarser step:
+    #   - rare rows (train-split count 1..QUANT_FF_EMB_RARE_MAX): step x3 on t23 -7.3 MB for +0.0004 r (RTN +0.0022);
+    #   - "soft trim" when the vocab trim is kept: the unseen rows from their ORIGINAL values at a very coarse step instead
+    #     of the mean row: t23 at 2.9 x the rows' rms +5.5 MB for -0.0064 r (RTN at 2.2 x rms: +7.2 MB for -0.0026), t05
+    #     no option beats the trim: the options are scanned at GPTQ probe 0 and the trim stays one of them;
+    #   - the unseen rows when the trim is rejected (lever E1's rows): x1 -0.0005 r, x2 half the RTN cost (t15).
+    # Rows with more occurrences stay RTN: they are read on the input side at every occurrence, where the error is |d|^2.
+    emb_gptq: dict[str, torch.Tensor] = {}  # name -> bool [rows]: rows quantised by GPTQ against head_H
+    rare: dict[str, torch.Tensor] = {}
+    rare_base0: dict[str, torch.Tensor] = {}
+    head_H = None
+    emb_damp = float(os.environ.get("QUANT_FF_EMB_GPTQ_DAMP", 0.1))
+    if os.environ.get("QUANT_FF_EMB_GPTQ", "1") == "1" and embed_names and used and model.get_output_embeddings() is not None:
+        t0 = time.time()
+        hw = model.get_output_embeddings().weight
+        head_name = next((n for n in embed_names if n in params and params[n] is hw), None)
+        if head_name is not None:
+            head_H = head_hessian(model, [r for r in pool if r.n_scored > 0], int(os.environ.get("QUANT_GPTQ_ROWS", 256)))
+        if head_H is not None:
+            rows_n = base.shapes[head_name][0]
+            cnt = torch.zeros(rows_n, dtype=torch.long)
+            for i, v in used.items():
+                if 0 <= i < rows_n:
+                    cnt[i] = min(int(v), SPECIAL_COUNT)
+            rare[head_name] = (cnt >= 1) & (cnt <= int(os.environ.get("QUANT_FF_EMB_RARE_MAX", 16)))
+            rare_base0[head_name] = alloc.base[head_name].clone()
+            emb_gptq[head_name] = rare[head_name].clone()
+            if head_name in unseen:
+                emb_gptq[head_name] |= unseen[head_name]
+            ev = torch.linalg.eigvalsh(head_H.double())
+            log.info("EMBGPTQ: head %s, H from the scored positions of the GPTQ rows (effective rank %.1f), %d rare rows (count 1..%s), %d rows by GPTQ, "
+                     "damp %.2g (%.0fs)", head_name, float(ev.sum() ** 2 / ev.pow(2).sum()), int(rare[head_name].sum()),
+                     os.environ.get("QUANT_FF_EMB_RARE_MAX", "16"), int(emb_gptq[head_name].sum()), emb_damp, time.time() - t0)
+    emb_cache: dict = {}
+
+    def q_emb(n: str, st: torch.Tensor):
+        """Quantiser of an embedding-like tensor at per-row steps st: RTN, and the rows in emb_gptq[n] by GPTQ against
+        head_H (the last result is cached: the embeddings keep their steps over the GPTQ probes)."""
+        w = base.tensor(n)
+        res = ecq.rtn_u(w, st, device=device)
+        m = emb_gptq.get(n)
+        if head_H is None or m is None or not bool(m.any()):
+            return res
+        key = (n, int(m.sum()), hash(st.float().numpy().tobytes()), hash(m.numpy().tobytes()), id(getattr(base, "overrides", {}).get(n)))
+        if emb_cache.get("key") == key:
+            return emb_cache["res"]
+        g = ecq.gptq_u(w[m], head_H, st[m], damp=emb_damp, act_order=True)
+        codes = res.codes.clone()
+        codes[m] = g.codes
+        out = ecq.UResult(codes, res.step)
+        emb_cache.update(key=key, res=out)
+        return out
 
     aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.001))
     size_pts: list[tuple[float, int]] = []  # (r, bytes) of encoded candidates: slope of ln bytes in r
@@ -1119,7 +1248,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         lin = {n: q for n, q in lin.items() if n in base.shapes and not is_embed_like(n)}
         for n in names_2d:
             if n not in lin:
-                lin[n] = ecq.rtn_u(base.tensor(n), steps[n], device=device)
+                lin[n] = q_emb(n, steps[n])
         set_weights(model, lin, 0)
         r, sigma = measure()
         if emb_scan and k == 0 and embed_names:
@@ -1144,7 +1273,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             for f_ in [float(x) for x in os.environ.get("QUANT_FF_EMB_SCAN_F", "0.35,0.5,0.65,0.8,1.25,1.6,2.0").split(",") if x]:
                 alloc.fixed_c = {n: c_e0 * f_ for n in embed_names}
                 st_e = alloc.steps(c)
-                q_e = {n: ecq.rtn_u(base.tensor(n), st_e[n], device=device) for n in emb_now}
+                q_e = {n: q_emb(n, st_e[n]) for n in emb_now}
                 set_weights(model, q_e, 0)
                 r_f, s_f = measure()
                 scan[f_] = (r_f, s_f, q_e, emb_bytes(q_e))
@@ -1161,46 +1290,95 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             lin.update(q_e)
             set_weights(model, q_e, 0)
             del scan
+            # row-class step scans on the embeddings at f_best (one eval per option). Bytes: the smaller of the zstd frame
+            # (ffcodec: wins while trimmed rows repeat) and the row-class rANS estimate, as the final coder will choose.
+            from quant import rans as _rans
+
+            def emb_bytes_rans(qd):
+                tot = 0
+                for n_, q_ in qd.items():
+                    cd = q_.codes.to(torch.int8).contiguous().cpu().numpy()
+                    spread = np.abs(cd.astype(np.float32)).mean(1)
+                    key = np.clip(np.round(16.0 * np.log2(spread + 1e-3)) + 128, 0, 255).astype(np.uint8)
+                    pm = np.argsort(key, kind="stable")
+                    tot += _rans.estimate_bytes(np.ascontiguousarray(cd[pm]), key[pm]) + cd.shape[0]
+                return tot
+
+            def emb_bytes_best(qd):
+                return min(emb_bytes(qd), emb_bytes_rans(qd)) if trimmed else emb_bytes_rans(qd)
+
+            def row_scan(tag, options, apply, cur):
+                """options: labels (the first = the current state, already quantised as cur = (r, sigma, q_e)); apply(label)
+                sets the allocation / overrides for that option. Keeps the option with the best block-equivalent score."""
+                t_s = time.time()
+                first = options[0]
+                sc_ = {first: (cur[0], cur[1], cur[2], emb_bytes_best(cur[2]))}
+                for o_ in options[1:]:
+                    apply(o_)
+                    st_o = alloc.steps(c)
+                    q_o = {n_: q_emb(n_, st_o[n_]) for n_ in cur[2]}
+                    set_weights(model, q_o, 0)
+                    r_o, s_o = measure()
+                    sc_[o_] = (r_o, s_o, q_o, emb_bytes_best(q_o))
+
+                def score_(o_):
+                    return math.log(rest + sc_[o_][3]) - k_blk * share * (sc_[first][0] - sc_[o_][0])
+                best_ = min(sc_, key=score_)
+                log.info("%s (f %.3g, k_blk %.1f): %s -> %s (%.0fs)", tag, f_best, k_blk,
+                         "; ".join(f"{o_}: r {sc_[o_][0]:.4f} emb {sc_[o_][3] / 1e6:.2f} MB score {score_(o_):.4f}" for o_ in options), best_, time.time() - t_s)
+                apply(best_)
+                set_weights(model, sc_[best_][2], 0)
+                return sc_[best_][0], sc_[best_][1], sc_[best_][2]
+
             if unseen and deadline.left() > 1200 + dq_reserve:
-                # lever E1: unseen-row step factor U at f_best (RTN, one eval each); bytes from the row-class rANS estimate
-                # (the final coder of the embedding: zstd's Huffman literals cannot go below 1 bit per code, rANS can)
-                from quant import rans as _rans
-                t_u = time.time()
-
-                def emb_bytes_rans(qd):
-                    tot = 0
-                    for n_, q_ in qd.items():
-                        cd = q_.codes.to(torch.int8).contiguous().cpu().numpy()
-                        spread = np.abs(cd.astype(np.float32)).mean(1)
-                        key = np.clip(np.round(16.0 * np.log2(spread + 1e-3)) + 128, 0, 255).astype(np.uint8)
-                        pm = np.argsort(key, kind="stable")
-                        tot += _rans.estimate_bytes(np.ascontiguousarray(cd[pm]), key[pm]) + cd.shape[0]
-                    return tot
-
+                # lever E1: unseen-row step factor U at f_best (the trim was rejected)
                 def set_u(u_):
                     for n_, m_ in unseen.items():
                         alloc.base[n_] = unseen_base0[n_] * torch.where(m_, torch.tensor(float(u_)), torch.tensor(1.0))
-                uscan = {1.0: (r, sigma, q_e, emb_bytes_rans(q_e))}
-                for u_ in [float(x) for x in os.environ.get("QUANT_FF_EMB_UNSEEN_U", "1.5,2,3,4,6").split(",") if x]:
-                    set_u(u_)
-                    st_u = alloc.steps(c)
-                    q_u = {n_: ecq.rtn_u(base.tensor(n_), st_u[n_], device=device) for n_ in q_e}
-                    set_weights(model, q_u, 0)
-                    r_u, s_u = measure()
-                    uscan[u_] = (r_u, s_u, q_u, emb_bytes_rans(q_u))
+                        if n_ in rare_base0:
+                            rare_base0[n_] = alloc.base[n_].clone()
+                u_opts = [1.0] + [float(x) for x in os.environ.get("QUANT_FF_EMB_UNSEEN_U", "1.5,2,3,4,6").split(",") if x]
+                r, sigma, q_e = row_scan("EMBUNSEEN (%s rows)" % ",".join(str(int(m_.sum())) for m_ in unseen.values()), u_opts, set_u, (r, sigma, q_e))
+            soft_names = [n_ for n_ in trimmed if n_ in emb_gptq and n_ in q_e]
+            if soft_names and os.environ.get("QUANT_FF_EMB_SOFT", "1") == "1" and deadline.left() > 1200 + dq_reserve:
+                # soft trim (the trim was kept): the trimmed rows of the head table from their original values, GPTQ against
+                # head_H, at step = S x the rms of those rows; "trim" (the mean row) stays an option
+                gp0 = {n_: emb_gptq[n_].clone() for n_ in soft_names}
+                c_emb = {n_: alloc.fixed_c[n_] for n_ in soft_names}
+                orig = {}
+                for n_ in soft_names:
+                    with safe_open(str(base.where[n_]), framework="pt") as sf:
+                        orig[n_] = float(sf.get_tensor(n_)[trimmed[n_]].float().pow(2).mean().sqrt())
 
-                def uscore(u_):
-                    return math.log(rest + uscan[u_][3]) - k_blk * share * (uscan[1.0][0] - uscan[u_][0])
-                u_best = min(uscan, key=uscore)
-                log.info("EMBUNSEEN (%s rows, f %.3g, k_blk %.1f): %s -> U %.3g (%.0fs)", ",".join(str(int(m_.sum())) for m_ in unseen.values()), f_best, k_blk,
-                         "; ".join(f"U {u_:g}: r {uscan[u_][0]:.4f} emb {uscan[u_][3] / 1e6:.2f} MB score {uscore(u_):.4f}" for u_ in sorted(uscan)),
-                         u_best, time.time() - t_u)
-                set_u(u_best)
-                steps = alloc.steps(c)
-                r, sigma, q_e, _ = uscan[u_best]
-                lin.update(q_e)
-                set_weights(model, q_e, 0)
-                del uscan
+                def set_soft(o_):
+                    for n_ in soft_names:
+                        ts, m_ = trim_state[n_], trimmed[n_]
+                        if o_ == "trim":
+                            base.overrides[n_] = ts["over"]
+                            alloc.base[n_] = ts["base"].clone()
+                            if ts["floor"] is not None:
+                                alloc.floor[n_] = ts["floor"].clone()
+                            emb_gptq[n_] = gp0[n_].clone()
+                        else:
+                            base.overrides.pop(n_, None)
+                            alloc.base[n_] = torch.where(m_, torch.tensor(float(o_) * orig[n_] / c_emb[n_]), ts["base"])
+                            if ts["floor0"] is not None:
+                                alloc.floor[n_] = ts["floor0"].clone()
+                            emb_gptq[n_] = gp0[n_] | m_
+                        if n_ in rare_base0:
+                            rare_base0[n_] = alloc.base[n_].clone()
+                s_opts = ["trim"] + [float(x) for x in os.environ.get("QUANT_FF_EMB_SOFT_S", "2,2.8,4").split(",") if x]
+                r, sigma, q_e = row_scan("EMBSOFT (%s rows)" % ",".join(str(int(trimmed[n_].sum())) for n_ in soft_names), s_opts, set_soft, (r, sigma, q_e))
+            if rare and any(bool(m_.any()) for m_ in rare.values()) and os.environ.get("QUANT_FF_EMB_RARE", "1") == "1" and deadline.left() > 1200 + dq_reserve:
+                # rare-row step factor (GPTQ rows): lever E1's idea for the rows seen 1..QUANT_FF_EMB_RARE_MAX times
+                def set_rare(x_):
+                    for n_, m_ in rare.items():
+                        alloc.base[n_] = rare_base0[n_] * torch.where(m_, torch.tensor(float(x_)), torch.tensor(1.0))
+                r_opts = [1.0] + [float(x) for x in os.environ.get("QUANT_FF_EMB_RARE_X", "2,3,4").split(",") if x]
+                r, sigma, q_e = row_scan("EMBRARE (%s rows)" % ",".join(str(int(m_.sum())) for m_ in rare.values()), r_opts, set_rare, (r, sigma, q_e))
+            steps = alloc.steps(c)
+            lin.update(q_e)
+            set_weights(model, q_e, 0)
         loss = r * ref_loss
         history.append((c, r))
         entries = []
@@ -1432,7 +1610,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             t0 = time.time()
             alloc.fixed_c = {n: c_e0 * f_ for n in embed_names}
             st_e = alloc.steps(c_e0)
-            emb_q = {n: ecq.rtn_u(base.tensor(n), st_e[n], device=device) for n in embed_names if n in names}
+            emb_q = {n: q_emb(n, st_e[n]) for n in embed_names if n in names}
             set_weights(model, emb_q, 0)
             r_, sigma_ = measure()
             lin_e = dict(final["lin"])
