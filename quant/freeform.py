@@ -626,7 +626,14 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             return dq.rtn_dq(w, dq_step(w, st), device=device)
         return ecq.rtn_u(w, st, device=device)
     history: list[tuple[float, float]] = []
-    max_probes = int(os.environ.get("QUANT_ECQ_PROBES", 5))
+    # Landing fix (QUANT_FF_EMB_OWN_C=1, default): the embeddings / head get their own step constant, fixed at the first
+    # GPTQ probe's c (times QUANT_FF_EMB_C_FACTOR); later probes move the decoder blocks alone. On t23 (2bfa93f, 24 Nov)
+    # the scalar tied embedding alone moved r +0.0126 between two probes 1.25x apart in c while the 28 blocks moved it
+    # +0.001, so the search bracketed early on the embedding's cliff and stopped ~0.010 r under the aim with ~35 min unused.
+    # With the embedding held, the GPTQ history is the blocks' own r(c) curve (every probe shares the embedding).
+    emb_own_c = os.environ.get("QUANT_FF_EMB_OWN_C", "1") == "1" and bool(embed_names)
+    emb_c_factor = float(os.environ.get("QUANT_FF_EMB_C_FACTOR", 1.0))
+    max_probes = int(os.environ.get("QUANT_ECQ_PROBES", 8 if emb_own_c else 5))
     tol = float(os.environ.get("QUANT_ECQ_TOL", 0.0015))
     probe_time = None
     log.info("ECQ: alloc %s, aim r %.4f, c0 %.4g, setup %.0fs", alloc.kind, aim, c, time.time() - t_start)
@@ -660,9 +667,11 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     def next_gptq_c(hist, rhist, target, c_now, r_now):
         """GPTQ's r(c) is the RTN curve shifted to larger c: estimate the shift from the latest GPTQ probe, use the RTN
         slope (models differ a lot: ~2 on 0.5-1.5B fine-tunes, ~4.6 on Qwen3-8B-Base), and move at most 1.25x."""
-        line = rtn_curve(rhist)
+        # with the embeddings held (emb_own_c) the RTN curve, which moved them too, is not the blocks' curve: secant on the
+        # GPTQ probes alone (slope prior 2), at most 1.25x per probe
+        line = None if emb_own_c else rtn_curve(rhist)
         if line is None:
-            return secant(hist, target, c_now, r_now, 1.5)
+            return secant(hist, target, c_now, r_now, 1.25 if emb_own_c else 1.5)
         a, _b = line
         if len(hist) >= 2:  # GPTQ's own slope once two GPTQ points exist, bounded by the RTN slope's range
             (x1, y1), (x2, y2) = [(math.log(cc), math.log(max(rr - 1.0, 1e-5))) for cc, rr in hist[-2:]]
@@ -818,6 +827,9 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             break
         t0 = time.time()
         restore()
+        if emb_own_c and k == 0:
+            alloc.fixed_c = {n: c * emb_c_factor for n in embed_names}
+            log.info("ECQ: embeddings held at c %.5g (%s) for every GPTQ probe", c * emb_c_factor, ",".join(embed_names))
         steps = alloc.steps(c)
 
         def quantizer(name, w, H):
@@ -925,17 +937,71 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         # secant in log space: log(r - 1) = a log c + b (a ~ 2 for uniform noise); one point -> a = 2
         c = nb if nb is not None else next_gptq_c(history, rtn_hist, aim, c, r)
 
+    def name_bytes(p: dict, n: str) -> int:
+        q = p["lin"].get(n)
+        if q is not None and getattr(q, "dq", False) and isinstance(getattr(q, "est", None), int):
+            return q.est
+        return sum(len(f) for f in p["enc"][n][1])
+
+    def unit_swaps(lo: dict, hi: dict) -> None:
+        """Instrumentation for the measured per-unit allocation (lever 2, QUANT_FF_UNIT_SWAP=1): from the lo probe, swap
+        ONE unit at a time to the hi probe's codes and measure r on the calibration rows (paired rows), giving each
+        unit's bytes saved and r cost. Units: the decoder blocks, then the module groups (q/k/v/o/gate/up/down across
+        all blocks), then all at once (additivity check). One "UNITSWAP {json}" line per eval; the model is left at lo."""
+        names = [n for n in names_2d if n in params]
+        sets = []
+        for b in sorted({unit_of(n) for n in names if unit_of(n) >= 0}):
+            sets.append((f"block{b}", [n for n in names if unit_of(n) == b]))
+        for g in sorted({group_key(n) for n in names if unit_of(n) >= 0}):
+            sets.append((f"group:{g}", [n for n in names if unit_of(n) >= 0 and group_key(n) == g]))
+        emb = [n for n in names if unit_of(n) < 0]
+        if emb and any(not torch.equal(lo["lin"][n].codes, hi["lin"][n].codes) for n in emb if n in lo["lin"] and n in hi["lin"]):
+            sets.append(("emb", emb))
+        sets.append(("all", names))
+        lo_b = {n: name_bytes(lo, n) for n in names}
+        hi_b = {n: name_bytes(hi, n) for n in names}
+        set_weights(model, {n: lo["lin"][n] for n in names}, 0)
+        r0, s0 = measure()
+        log.info("UNITSWAP %s", json.dumps({"unit": "lo", "r": r0, "c_lo": lo["c"], "c_hi": hi["c"], "r_lo_probe": lo["r"], "r_hi_probe": hi["r"],
+                                            "bytes_lo": sum(lo_b.values()), "bytes_hi": sum(hi_b.values())}))
+        t_sw = time.time()
+        for u, ns in sets:
+            if deadline.left() < 600 + dq_reserve:
+                log.info("UNITSWAP: out of time at %s", u)
+                break
+            t0 = time.time()
+            set_weights(model, {n: hi["lin"][n] for n in ns}, 0)
+            r1, _ = measure()
+            set_weights(model, {n: lo["lin"][n] for n in ns}, 0)
+            log.info("UNITSWAP %s", json.dumps({"unit": u, "n": len(ns), "r": r1, "dr": r1 - r0, "dB": sum(lo_b[n] - hi_b[n] for n in ns),
+                                                "B_lo": sum(lo_b[n] for n in ns), "s": round(time.time() - t0, 1)}))
+        log.info("UNITSWAP done: %d sets in %.0fs", len(sets), time.time() - t_sw)
+
     # Layer mix (landing mode): with a probe under the aim (lo) and one over it (hi), take the first m mixing units
     # (decoder blocks, embeddings last) from hi and the rest from lo. r and bytes move in ~1/units steps between the two
     # probes, so the landing gets much finer than a GPTQ probe can be placed, at the cost of one eval pass per step.
     if tgt is not None and "lo" in keep and "hi" in keep and deadline.left() > 240 + dq_reserve:
         lo, hi = keep["lo"], keep["hi"]
         # decoder blocks first, embeddings / head last: on t15 the tied embedding alone moved r +0.0045 for 4 MB
-        units = sorted(u for u in {unit_of(n) for n in names_2d} if u >= 0) + ([-1] if any(unit_of(n) < 0 for n in names_2d) else [])
+        # QUANT_FF_MIX_UNIT=linear (default): every decoder Linear is its own unit (block order, then module order), so
+        # one unit moves r by ~1/200 of the bracket instead of ~1/29; "block": the 2bfa93f rule (one unit per block)
+        mix_linear = os.environ.get("QUANT_FF_MIX_UNIT", "linear") == "linear"
+        pos = {n: i for i, n in enumerate(names_2d)}
+
+        def ukey(n: str):
+            return (unit_of(n), pos[n]) if mix_linear else unit_of(n)
+        blocks = [n for n in names_2d if unit_of(n) >= 0]
+        units = sorted({ukey(n) for n in blocks}) + sorted({ukey(n) for n in names_2d if unit_of(n) < 0})
+        unit_of_name = {n: ukey(n) for n in names_2d}
+        if os.environ.get("QUANT_FF_UNIT_SWAP", "0") == "1":
+            try:
+                unit_swaps(lo, hi)
+            except Exception as exc:  # noqa: BLE001 - instrumentation only: the mix below still runs
+                log.warning("UNITSWAP failed: %r", exc)
         m_lo, r_lo, m_hi, r_hi = 0, lo["r"], len(units), hi["r"]
         tol_mix = float(os.environ.get("QUANT_FF_MIX_TOL", 0.0008))
         eval_time = None
-        for j in range(int(os.environ.get("QUANT_FF_MIX_EVALS", 5))):
+        for j in range(int(os.environ.get("QUANT_FF_MIX_EVALS", 8 if mix_linear else 5))):
             if m_hi - m_lo <= 1 or (eval_time is not None and deadline.left() < eval_time * 2 + 180 + dq_reserve) or deadline.left() < 240 + dq_reserve:
                 break
             t0 = time.time()
@@ -943,7 +1009,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             m = int(round(m_lo + frac * (m_hi - m_lo)))
             m = min(m_hi - 1, max(m_lo + 1, m))
             from_hi = set(units[:m])
-            src_of = {n: (hi if unit_of(n) in from_hi else lo) for n in names_2d}
+            src_of = {n: (hi if unit_of_name[n] in from_hi else lo) for n in names_2d}
             set_weights(model, {n: src_of[n]["lin"][n] for n in names_2d if n in params}, 0)
             r, sigma = measure()
             parts = [(src_of[name] if name in src_of else lo)["enc"][name] for name in base.shapes]

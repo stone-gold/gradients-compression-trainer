@@ -212,8 +212,15 @@ class Allocation:
         self.floor = {n: (a.float() / max_code).clamp(min=1e-12) for n, a in absmax.items()}
 
     def steps(self, c: float) -> dict[str, torch.Tensor]:
+        """Steps at the global constant c; tensors in fixed_c keep their own constant (freeform: the tied embedding is
+        held at the first GPTQ probe's c while the search moves the decoder blocks)."""
         floor = getattr(self, "floor", {})
-        return {n: torch.maximum(b * c, floor[n]).float() if n in floor else (b * c).float() for n, b in self.base.items()}
+        fixed = getattr(self, "fixed_c", {})
+        out = {}
+        for n, b in self.base.items():
+            s = b * fixed.get(n, c)
+            out[n] = torch.maximum(s, floor[n]).float() if n in floor else s.float()
+        return out
 
     def c_for_loss(self, delta_loss: float) -> float:
         """Noise-model guess: delta_loss = sum_l n_l f_l (c b_l)^2 / 24 with f_l b_l^2 = 1 -> c = sqrt(24 dL / N)."""
