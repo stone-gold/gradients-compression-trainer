@@ -1342,7 +1342,11 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                         alloc.base[n_] = unseen_base0[n_] * torch.where(m_, torch.tensor(float(u_)), torch.tensor(1.0))
                         if n_ in rare_base0:
                             rare_base0[n_] = alloc.base[n_].clone()
-                u_opts = [1.0] + [float(x) for x in os.environ.get("QUANT_FF_EMB_UNSEEN_U", "1.5,2,3,4,6").split(",") if x]
+                # U capped at 2 (26 Nov): with the GPTQ rows the scan picked U 3 in 3 of 3 t15 runs (calibration rows: +0.0013 r
+                # vs U 2 for -12 MB), but on the 599 local test rows the same artifact paid +0.0046 (se 0.0013) and one run
+                # shipped r_test 1.0436. Unseen ids are ~0.7% of the tokens, ~480 occurrences in the calibration rows: too few
+                # to price the input-side error of a coarser step, so the scan stays inside the range E1 measured.
+                u_opts = [1.0] + [float(x) for x in os.environ.get("QUANT_FF_EMB_UNSEEN_U", "1.5,2").split(",") if x]
                 r, sigma, q_e = row_scan("EMBUNSEEN (%s rows)" % ",".join(str(int(m_.sum())) for m_ in unseen.values()), u_opts, set_u, (r, sigma, q_e))
             soft_names = [n_ for n_ in trimmed if n_ in emb_gptq and n_ in q_e]
             if soft_names and os.environ.get("QUANT_FF_EMB_SOFT", "1") == "1" and deadline.left() > 1200 + dq_reserve:
@@ -1604,7 +1608,9 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # probe's codes while it is under the aim, back to the fine probe's codes if it is over. Every step is a candidate in
     # consider() (expected S), r carries the selection correction, and without time or without acceptance the normal
     # landing stands.
-    if os.environ.get("QUANT_FF_PICK4", "1") == "1" and tgt is not None and final is not None and probe_time is not None and keep.get("lo") is not None:
+    # OFF by default (26 Nov): in its two full runs (t15, t05) the pick was rejected by the odd rows (even-row gains of
+    # 0.003 that the odd rows did not show), so it shipped the normal landing after 330-370 s: no measured gain.
+    if os.environ.get("QUANT_FF_PICK4", "0") == "1" and tgt is not None and final is not None and probe_time is not None and keep.get("lo") is not None:
         over = float(os.environ.get("QUANT_FF_PICK4_OVER", 0.006))
         ev_t = eval_t or 25.0
         need = probe_time * 1.25 + 30 * 0.6 * ev_t + 10 * ev_t + 330 + dq_reserve
