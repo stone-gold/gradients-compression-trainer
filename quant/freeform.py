@@ -1035,7 +1035,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         b = [y for x, y in zip(rl, ref) if x == x and y == y]
         return sum(a) / max(1e-12, sum(b))
 
-    def block_pick(fin: dict):
+    def block_pick(fin: dict, full: bool = False):
         nonlocal eval_t
         t_all = time.time()
         st = fin["steps"]
@@ -1115,7 +1115,12 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         r_, sigma_ = measure()
         entries = [ffcodec.Entry(name, shape, q=comb[name]) if name in comb else ffcodec.Entry(name, shape, tensor=base.tensor(name))
                    for name, shape in base.shapes.items()]
-        consider(fin["name"] + f"-pick{len(pick)}", entries, r_ + bias, sigma=sigma_)
+        # the blocks were chosen on the even rows: half of the even-over-odd excess gain is selection optimism in the all-rows r
+        corr = max(0.0, ((ra_e - rc_e) - (ra_o - rc_o)) / 2.0) if full else 0.0
+        records, frames, est = consider(fin["name"] + f"-pick{len(pick)}", entries, r_ + corr + bias, sigma=sigma_)
+        if full:
+            return {"lin": comb, "r": r_, "sigma": sigma_, "corr": corr, "pick": pick, "enc": split_encoded(records, frames), "est": est,
+                    "name": fin["name"] + f"-pick{len(pick)}", "gain_odd": ra_o - rc_o, "gain_even": ra_e - rc_e}
         return comb, r_
 
     def gptq_at(st: dict, smp: list) -> dict:
@@ -1590,6 +1595,120 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                     except Exception as exc:  # noqa: BLE001
                         log.warning("pick re-land failed: %r", exc)
             del fin_over, lin_o
+    # Lever 2c v4 (land6, QUANT_FF_PICK4=1): the per-block best-of-two-draws pick lowers r by ~0.007-0.017 at the SAME bytes
+    # (25 Nov, 4 of 5 picks accepted by the held-out odd rows and confirmed on the test rows), but v1-v3 could not turn it
+    # into bytes: the picked model landed far under the aim (t15 r_test 1.0246) with no time or no coarser probe to re-land.
+    # v4: (1) make sure a probe sits at least QUANT_FF_PICK4_OVER above the aim (one extra probe if the search ended
+    # without one), (2) build the mix that lands `over` above the aim, draw B at its steps, pick per block on the even
+    # rows, accept on the odd rows, (3) re-land the picked model with unit swaps that cost no new probe: toward the coarse
+    # probe's codes while it is under the aim, back to the fine probe's codes if it is over. Every step is a candidate in
+    # consider() (expected S), r carries the selection correction, and without time or without acceptance the normal
+    # landing stands.
+    if os.environ.get("QUANT_FF_PICK4", "1") == "1" and tgt is not None and final is not None and probe_time is not None and keep.get("lo") is not None:
+        over = float(os.environ.get("QUANT_FF_PICK4_OVER", 0.006))
+        ev_t = eval_t or 25.0
+        need = probe_time * 1.25 + 30 * 0.6 * ev_t + 10 * ev_t + 330 + dq_reserve
+        t_p4 = time.time()
+        try:
+            lo, hi = keep["lo"], keep.get("hi")
+            if (hi is None or hi["r"] < aim + over) and deadline.left() > need + probe_time * 1.25:
+                c_ref, r_ref = (hi["c"], hi["r"]) if hi is not None else (lo["c"], lo["r"])
+                c_new = c_ref * math.exp((math.log(max(aim + over + 0.003 - 1.0, 1e-5)) - math.log(max(r_ref - 1.0, 1e-5))) / 2.0)
+                c_new = min(c_ref * 1.3, max(c_ref * 1.06, c_new))
+                st_new = alloc.steps(c_new)
+                lin_h = gptq_at(st_new, samples)
+                for n in names_2d:
+                    if n not in lin_h:
+                        lin_h[n] = q_emb(n, st_new[n]) if is_embed_like(n) else ecq.rtn_u(base.tensor(n), st_new[n], device=device)
+                set_weights(model, {n: lin_h[n] for n in names_2d if n in params}, 0)
+                r_h, s_h = measure()
+                ents = [ffcodec.Entry(name, shape, q=lin_h[name]) if name in lin_h else ffcodec.Entry(name, shape, tensor=base.tensor(name))
+                        for name, shape in base.shapes.items()]
+                rec_h, fr_h, est_h = consider(f"ecq-{alloc.kind}-c{c_new:.4g}", ents, r_h + bias, sigma=s_h)
+                del ents
+                history.append((c_new, r_h))
+                log.info("PICK4: coarse probe c %.4g r %.4f (aim %.4f + %.4f), ~%.1f MB, %.0fs", c_new, r_h, aim, over, est_h / 1e6, time.time() - t_p4)
+                cand_h = {"c": c_new, "r": r_h, "sigma": s_h, "lin": lin_h, "enc": split_encoded(rec_h, fr_h), "steps": st_new}
+                if r_h > aim and (hi is None or r_h > hi["r"]):
+                    hi = cand_h
+                elif r_h <= aim and r_h > lo["r"]:
+                    lo = cand_h
+                del rec_h, fr_h
+            if hi is not None and hi["r"] > aim and deadline.left() > need:
+                pos4 = {n: i for i, n in enumerate(names_2d)}
+                blocks4 = [n for n in names_2d if unit_of(n) >= 0]
+                units4 = sorted({(unit_of(n), pos4[n]) for n in blocks4})
+                uo4 = {n: (unit_of(n), pos4[n]) for n in names_2d}
+                r_t = min(aim + over, hi["r"])
+                frac = (r_t - lo["r"]) / max(1e-9, hi["r"] - lo["r"])
+                m0 = min(len(units4), max(1, int(round(frac * len(units4)))))
+                from_hi = set(units4[:m0])
+                src0 = {n: (hi if uo4[n] in from_hi else lo) for n in names_2d}
+                lin_o = {n: src0[n]["lin"][n] for n in names_2d}
+                set_weights(model, {n: lin_o[n] for n in names_2d if n in params}, 0)
+                r_o, _ = measure()
+                log.info("PICK4: over-aim mix %d/%d units from c %.4g, r %.4f (target %.4f; lo %.4f hi %.4f)", m0, len(units4), hi["c"], r_o, r_t, lo["r"], hi["r"])
+                P = block_pick({"lin": lin_o, "r": r_o, "name": f"ecq-over-c{lo['c']:.4g}-c{hi['c']:.4g}-m{m0}of{len(units4)}",
+                                "steps": {n: src0[n]["steps"][n] for n in names_2d}}, full=True)
+                if P is not None:
+                    r_p = P["r"] + P["corr"]
+                    log.info("PICK4: picked %d blocks, r %.4f (+%.4f selection correction; odd-row gain %.4f, even %.4f), ~%.1f MB", len(P["pick"]),
+                             P["r"], P["corr"], P["gain_odd"], P["gain_even"], P["est"] / 1e6)
+
+                    def p4_consider(tag, lin_m, parts):
+                        set_weights(model, {n: lin_m[n] for n in names_2d if n in params}, 0)
+                        r_m, s_m = measure()
+                        ents_m = [ffcodec.Entry(name, shape, q=lin_m[name]) if name in lin_m else ffcodec.Entry(name, shape, tensor=base.tensor(name))
+                                  for name, shape in base.shapes.items()]
+                        _, _, est_m = consider(tag, ents_m, r_m + P["corr"] + bias, sigma=s_m, enc=join_encoded(parts))
+                        return r_m + P["corr"], s_m, est_m
+
+                    def p4_final(tag, lin_m, r_m, s_m, est_m):
+                        nonlocal final
+                        sc_m = tgt.expected_ln_s(est_m, r_m + bias, s_m)
+                        if sc_m < final["score"]:
+                            final = {"lin": dict(lin_m), "r": r_m, "name": tag, "score": sc_m, "steps": {n: src0[n]["steps"][n] for n in names_2d},
+                                     "corr": P["corr"]}
+                    p4_final(P["name"], P["lin"], r_p, P["sigma"], P["est"])
+                    tol_p = float(os.environ.get("QUANT_FF_MIX_TOL", 0.0008))
+                    if r_p < aim - tol_p:
+                        swap, other, tagk = [u for u in units4 if u not in from_hi], hi, "up"  # still on the fine probe's steps -> coarse codes
+                    elif r_p > aim + tol_p:
+                        swap, other, tagk = [u for u in reversed(units4) if u in from_hi], lo, "down"  # coarse steps -> fine codes
+                    else:
+                        swap, other, tagk = [], None, ""
+                    j_lo, j_hi, r_a, r_b = 0, len(swap), r_p, None
+                    for it in range(int(os.environ.get("QUANT_FF_PICK4_EVALS", 6))):
+                        if j_hi - j_lo <= 1 and it > 0 or not swap or deadline.left() < 2 * ev_t + 240 + dq_reserve:
+                            break
+                        if it == 0:
+                            j = len(swap)  # the far end first: is the aim inside?
+                        else:
+                            frac = (aim - r_a) / (r_b - r_a) if r_b is not None and abs(r_b - r_a) > 1e-9 else 0.5
+                            j = min(j_hi - 1, max(j_lo + 1, int(round(j_lo + frac * (j_hi - j_lo)))))
+                        sw = set(swap[:j])
+                        lin_m = {n: (other["lin"][n] if uo4[n] in sw else P["lin"][n]) for n in names_2d}
+                        parts = [((other if uo4[name] in sw else P) if name in uo4 else lo)["enc"][name] for name in base.shapes]
+                        tag = f"{P['name']}-{tagk}{j}of{len(swap)}"
+                        r_m, s_m, est_m = p4_consider(tag, lin_m, parts)
+                        log.info("PICK4 re-land %d (%s): %d/%d units swapped, r %.4f (aim %.4f), ~%.1f MB", it, tagk, j, len(swap), r_m, aim, est_m / 1e6)
+                        p4_final(tag, lin_m, r_m, s_m, est_m)
+                        inside = (r_m >= aim) if tagk == "up" else (r_m <= aim)
+                        if it == 0 and not inside:
+                            break  # even the full swap stays on the same side of the aim: it is the best this bracket can do
+                        if abs(r_m - aim) <= tol_p:
+                            break
+                        if (r_m < aim) == (tagk == "up"):
+                            j_lo, r_a = j, r_m
+                        else:
+                            j_hi, r_b = j, r_m
+                        del lin_m, parts
+                del lin_o
+            log.info("PICK4 done in %.0fs (%.0fs left)", time.time() - t_p4, deadline.left())
+        except Exception as exc:  # noqa: BLE001 - the normal landing stands
+            log.warning("PICK4 failed: %r", exc)
+            import traceback
+            log.warning("%s", traceback.format_exc())
     keep.clear()
     gc.collect()
     # Lever 1b (QUANT_FF_EMB_SEARCH=1): the embeddings were held at the first probe's c (lever 1); with the blocks landed,
@@ -1617,7 +1736,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             lin_e.update(emb_q)
             entries = [ffcodec.Entry(name, shape, q=lin_e[name]) if name in lin_e else ffcodec.Entry(name, shape, tensor=base.tensor(name))
                        for name, shape in base.shapes.items()]
-            _, _, est = consider(final["name"] + f"-emb{f_:g}", entries, r_ + bias, sigma=sigma_)
+            _, _, est = consider(final["name"] + f"-emb{f_:g}", entries, r_ + final.get("corr", 0.0) + bias, sigma=sigma_)
             log.info("EMBSEARCH factor %.3g (c %.4g): r %.4f, ~%.1f MB, %.0fs", f_, c_e0 * f_, r_, est / 1e6, time.time() - t0)
             del entries, lin_e
             set_weights(model, {n: final["lin"][n] for n in embed_names if n in names}, 0)
