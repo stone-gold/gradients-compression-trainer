@@ -872,6 +872,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     realloc = os.environ.get("QUANT_FF_BLOCK_REALLOC", "0") == "1"
     realloc_done = False
     eval_t = None
+    picked_over = False
 
     def split_r() -> tuple[float, float, float]:
         """(r all rows, r even rows, r odd rows) of the weights in the model."""
@@ -1244,6 +1245,33 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 m_hi, r_hi = m, r
             if abs(r - aim) <= tol_mix:
                 break
+        # lever 2c v2 (QUANT_FF_PICK_OVER > 0 with QUANT_FF_BLOCK_PICK=1): a block pick lowers r at the same bytes (t23, 25 Nov:
+        # held-out rows -0.0099, test r 1.0286 vs 1.0382 predicted for the unpicked model), which only pays if the blocks
+        # were coarser to begin with: build a second mix landing QUANT_FF_PICK_OVER above the aim and pick on THAT; the
+        # picked model competes with the normal landing in consider() (expected S), so a weak pick leaves the landing as is.
+        over = float(os.environ.get("QUANT_FF_PICK_OVER", 0))
+        if over > 0 and os.environ.get("QUANT_FF_BLOCK_PICK", "0") == "1" and probe_time is not None and \
+                deadline.left() > probe_time * 1.25 + 30 * 0.6 * (eval_t or 25) + 360 + dq_reserve:
+            r_t = aim + over
+            if hi["r"] <= r_t:
+                m = len(units)
+            else:
+                frac = (r_t - r_lo) / max(1e-9, hi["r"] - r_lo)
+                m = min(len(units), max(m_lo + 1, int(round(m_lo + frac * (len(units) - m_lo)))))
+            from_hi = set(units[:m])
+            src_of = {n: (hi if unit_of_name[n] in from_hi else lo) for n in names_2d}
+            lin_o = {n: src_of[n]["lin"][n] for n in names_2d}
+            set_weights(model, {n: lin_o[n] for n in names_2d if n in params}, 0)
+            r_o, _ = measure()
+            log.info("PICKOVER: over-aim mix %d/%d units, r %.4f (target %.4f)", m, len(units), r_o, r_t)
+            fin_over = {"lin": lin_o, "r": r_o, "name": f"ecq-over-c{lo['c']:.4g}-c{hi['c']:.4g}-m{m}of{len(units)}",
+                        "steps": {n: src_of[n]["steps"][n] for n in names_2d}}
+            try:
+                block_pick(fin_over)
+                picked_over = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("pick over failed: %r", exc)
+            del fin_over, lin_o
     keep.clear()
     gc.collect()
     # Lever 1b (QUANT_FF_EMB_SEARCH=1): the embeddings were held at the first probe's c (lever 1); with the blocks landed,
@@ -1283,7 +1311,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # shipped candidate's exact steps (Hessians from the next QUANT_GPTQ_ROWS train rows) is made; each decoder block takes
     # B's codes when its single-block swap lowers r on the EVEN calibration rows; the combined model is accepted only if
     # its r on the ODD rows (not used for the choice) is lower than the candidate's there, and then competes in consider().
-    if os.environ.get("QUANT_FF_BLOCK_PICK", "0") == "1" and tgt is not None and final is not None and final.get("steps") \
+    if os.environ.get("QUANT_FF_BLOCK_PICK", "0") == "1" and not picked_over and tgt is not None and final is not None and final.get("steps") \
             and probe_time is not None and deadline.left() > probe_time * 1.25 + 30 * 0.6 * (eval_t or 25) + 330 + dq_reserve:
         try:
             block_pick(final)
