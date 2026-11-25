@@ -633,6 +633,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # With the embedding held, the GPTQ history is the blocks' own r(c) curve (every probe shares the embedding).
     emb_own_c = os.environ.get("QUANT_FF_EMB_OWN_C", "1") == "1" and bool(embed_names)
     emb_c_factor = float(os.environ.get("QUANT_FF_EMB_C_FACTOR", 1.0))
+    emb_scan = emb_own_c and os.environ.get("QUANT_FF_EMB_SCAN", "0") == "1"
     max_probes = int(os.environ.get("QUANT_ECQ_PROBES", 8 if emb_own_c else 5))
     tol = float(os.environ.get("QUANT_ECQ_TOL", 0.0015))
     probe_time = None
@@ -1069,6 +1070,45 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 lin[n] = ecq.rtn_u(base.tensor(n), steps[n], device=device)
         set_weights(model, lin, 0)
         r, sigma = measure()
+        if emb_scan and k == 0 and embed_names:
+            # Lever 1c (QUANT_FF_EMB_SCAN=1): with probe 0's block codes in place, re-quantise the embeddings (RTN) at
+            # c0 x f for a few f and pick f minimising ln(bytes) - k_blk * share_blocks * (r(1) - r(f)): a lower r here lets
+            # the blocks land coarser at the block bytes slope k_blk. Measured 25 Nov: t05 f 0.8 -> r -0.0062 for +1.6 MB
+            # (~0.26 MB per 0.001 r, blocks ~2 MB per 0.001 r), t23 f0.8 -14%, t15 f0.8 worse: the right f is task-specific.
+            t_sc = time.time()
+            k_blk = float(os.environ.get("QUANT_FF_EMB_SCAN_K", 8.0))
+            c_e0 = alloc.fixed_c[embed_names[0]]
+
+            def emb_bytes(qd):
+                _, fr = ffcodec.encode([ffcodec.Entry(n, base.shapes[n], q=qd[n]) for n in qd], level=int(os.environ.get("QUANT_FF_ZSTD", 0)))
+                return ffcodec.encoded_size(fr)
+            rest = 0
+            for n, q in lin.items():
+                if n not in embed_names:
+                    e_ = getattr(q, "est", None)
+                    rest += e_ if isinstance(e_, int) else int(q.codes.numel())
+            emb_now = {n: lin[n] for n in embed_names if n in lin}
+            scan = {1.0: (r, sigma, emb_now, emb_bytes(emb_now))}
+            for f_ in [float(x) for x in os.environ.get("QUANT_FF_EMB_SCAN_F", "0.5,0.65,0.8,1.25").split(",") if x]:
+                alloc.fixed_c = {n: c_e0 * f_ for n in embed_names}
+                st_e = alloc.steps(c)
+                q_e = {n: ecq.rtn_u(base.tensor(n), st_e[n], device=device) for n in emb_now}
+                set_weights(model, q_e, 0)
+                r_f, s_f = measure()
+                scan[f_] = (r_f, s_f, q_e, emb_bytes(q_e))
+            share = rest / max(1, rest + scan[1.0][3])
+
+            def score(f_):
+                return math.log(rest + scan[f_][3]) - k_blk * share * (scan[1.0][0] - scan[f_][0])
+            f_best = min(scan, key=score)
+            log.info("EMBSCAN (k_blk %.1f, blocks ~%.1f MB): %s -> f %.3g (%.0fs)", k_blk, rest / 1e6,
+                     "; ".join(f"f {f_:g}: r {scan[f_][0]:.4f} emb {scan[f_][3] / 1e6:.2f} MB score {score(f_):.4f}" for f_ in sorted(scan)), f_best, time.time() - t_sc)
+            alloc.fixed_c = {n: c_e0 * f_best for n in embed_names}
+            steps = alloc.steps(c)
+            r, sigma, q_e, _ = scan[f_best]
+            lin.update(q_e)
+            set_weights(model, q_e, 0)
+            del scan
         loss = r * ref_loss
         history.append((c, r))
         entries = []
