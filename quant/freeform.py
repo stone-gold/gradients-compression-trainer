@@ -20,6 +20,7 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors import safe_open
 
@@ -525,6 +526,8 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # its own measured cost at bf16 (all else unquantised) is at most QUANT_FF_TRIM_MAX in r: t15 (small train split, 19k of
     # 152k ids) paid +0.034, t23 / t05 (49k ids) much less. Calibration rows are NOT added to the used set, so they see
     # unseen-token misses at the rate the scored rows will.
+    unseen: dict[str, torch.Tensor] = {}
+    unseen_base0: dict[str, torch.Tensor] = {}
     if os.environ.get("QUANT_FF_VOCAB_TRIM", "1") == "1" and embed_names:
         t0 = time.time()
         used = used_token_ids(args.task_id, args.dataset, tok, [], float(os.environ.get("QUANT_FF_VOCAB_SECONDS", 240)))
@@ -564,6 +567,14 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             else:
                 for n in plan:
                     params[n].data.copy_(base.tensor(n).to(params[n].dtype).to(params[n].device))
+                # lever E1 (QUANT_FF_EMB_UNSEEN=1): the trim is rejected (t15: 133k of 152k rows never occur in the train split,
+                # yet 0.7% of the scored tokens are such ids), and the 128 Fisher rows see so few tokens that 98.8% of the
+                # embedding rows sit at the coarse row clamp on one shared step (F_t15_a: 150k rows, 70 MB, 2.43 bits per
+                # weight; the unseen rows alone ~62 MB for 0.7% of the tokens). Keep the unseen mask: at GPTQ probe 0 the
+                # unseen rows' step is scanned x U (one eval each) and the U with the best block-equivalent score is kept.
+                if os.environ.get("QUANT_FF_EMB_UNSEEN", "1") == "1":
+                    unseen = {n: m for n, (m, _) in plan.items()}
+                    unseen_base0 = {n: alloc.base[n].clone() for n in unseen}
 
     aim = target["knee"] - margin - float(os.environ.get("QUANT_ECQ_UNDERSHOOT", 0.001))
     size_pts: list[tuple[float, int]] = []  # (r, bytes) of encoded candidates: slope of ln bytes in r
@@ -1150,6 +1161,46 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             lin.update(q_e)
             set_weights(model, q_e, 0)
             del scan
+            if unseen and deadline.left() > 1200 + dq_reserve:
+                # lever E1: unseen-row step factor U at f_best (RTN, one eval each); bytes from the row-class rANS estimate
+                # (the final coder of the embedding: zstd's Huffman literals cannot go below 1 bit per code, rANS can)
+                from quant import rans as _rans
+                t_u = time.time()
+
+                def emb_bytes_rans(qd):
+                    tot = 0
+                    for n_, q_ in qd.items():
+                        cd = q_.codes.to(torch.int8).contiguous().cpu().numpy()
+                        spread = np.abs(cd.astype(np.float32)).mean(1)
+                        key = np.clip(np.round(16.0 * np.log2(spread + 1e-3)) + 128, 0, 255).astype(np.uint8)
+                        pm = np.argsort(key, kind="stable")
+                        tot += _rans.estimate_bytes(np.ascontiguousarray(cd[pm]), key[pm]) + cd.shape[0]
+                    return tot
+
+                def set_u(u_):
+                    for n_, m_ in unseen.items():
+                        alloc.base[n_] = unseen_base0[n_] * torch.where(m_, torch.tensor(float(u_)), torch.tensor(1.0))
+                uscan = {1.0: (r, sigma, q_e, emb_bytes_rans(q_e))}
+                for u_ in [float(x) for x in os.environ.get("QUANT_FF_EMB_UNSEEN_U", "1.5,2,3,4,6").split(",") if x]:
+                    set_u(u_)
+                    st_u = alloc.steps(c)
+                    q_u = {n_: ecq.rtn_u(base.tensor(n_), st_u[n_], device=device) for n_ in q_e}
+                    set_weights(model, q_u, 0)
+                    r_u, s_u = measure()
+                    uscan[u_] = (r_u, s_u, q_u, emb_bytes_rans(q_u))
+
+                def uscore(u_):
+                    return math.log(rest + uscan[u_][3]) - k_blk * share * (uscan[1.0][0] - uscan[u_][0])
+                u_best = min(uscan, key=uscore)
+                log.info("EMBUNSEEN (%s rows, f %.3g, k_blk %.1f): %s -> U %.3g (%.0fs)", ",".join(str(int(m_.sum())) for m_ in unseen.values()), f_best, k_blk,
+                         "; ".join(f"U {u_:g}: r {uscan[u_][0]:.4f} emb {uscan[u_][3] / 1e6:.2f} MB score {uscore(u_):.4f}" for u_ in sorted(uscan)),
+                         u_best, time.time() - t_u)
+                set_u(u_best)
+                steps = alloc.steps(c)
+                r, sigma, q_e, _ = uscan[u_best]
+                lin.update(q_e)
+                set_weights(model, q_e, 0)
+                del uscan
         loss = r * ref_loss
         history.append((c, r))
         entries = []
