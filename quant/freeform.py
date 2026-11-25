@@ -633,7 +633,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # With the embedding held, the GPTQ history is the blocks' own r(c) curve (every probe shares the embedding).
     emb_own_c = os.environ.get("QUANT_FF_EMB_OWN_C", "1") == "1" and bool(embed_names)
     emb_c_factor = float(os.environ.get("QUANT_FF_EMB_C_FACTOR", 1.0))
-    emb_scan = emb_own_c and os.environ.get("QUANT_FF_EMB_SCAN", "0") == "1"
+    emb_scan = emb_own_c and os.environ.get("QUANT_FF_EMB_SCAN", "1") == "1"
     max_probes = int(os.environ.get("QUANT_ECQ_PROBES", 8 if emb_own_c else 5))
     tol = float(os.environ.get("QUANT_ECQ_TOL", 0.0015))
     probe_time = None
@@ -1130,7 +1130,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                     rest += e_ if isinstance(e_, int) else int(q.codes.numel())
             emb_now = {n: lin[n] for n in embed_names if n in lin}
             scan = {1.0: (r, sigma, emb_now, emb_bytes(emb_now))}
-            for f_ in [float(x) for x in os.environ.get("QUANT_FF_EMB_SCAN_F", "0.5,0.65,0.8,1.25").split(",") if x]:
+            for f_ in [float(x) for x in os.environ.get("QUANT_FF_EMB_SCAN_F", "0.35,0.5,0.65,0.8,1.25,1.6,2.0").split(",") if x]:
                 alloc.fixed_c = {n: c_e0 * f_ for n in embed_names}
                 st_e = alloc.steps(c)
                 q_e = {n: ecq.rtn_u(base.tensor(n), st_e[n], device=device) for n in emb_now}
@@ -1367,7 +1367,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # re-quantise them (RTN, as always) at a few other constants and let the expected-S rule choose. t15 (real data, untrimmed
     # 72 MB embedding) paid for the held fine embedding (f0.8 +1.2%, wave-B candidate +~2% vs 2bfa93f), t23 / t05 gained
     # from a finer one (f0.8 -14% / -5%): the right constant is task-specific, so it is measured, one eval per option.
-    if os.environ.get("QUANT_FF_EMB_SEARCH", "0") == "1" and tgt is not None and final is not None and emb_own_c \
+    if os.environ.get("QUANT_FF_EMB_SEARCH", "1") == "1" and tgt is not None and final is not None and emb_own_c \
             and getattr(alloc, "fixed_c", None) and deadline.left() > 300 + dq_reserve:
         c_e0 = next(iter(alloc.fixed_c.values()))
         facs = [float(x) for x in os.environ.get("QUANT_FF_EMB_SEARCH_F", "0.8,1.25,1.6").split(",") if x]
