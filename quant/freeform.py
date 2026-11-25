@@ -1206,6 +1206,38 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 break
     keep.clear()
     gc.collect()
+    # Lever 1b (QUANT_FF_EMB_SEARCH=1): the embeddings were held at the first probe's c (lever 1); with the blocks landed,
+    # re-quantise them (RTN, as always) at a few other constants and let the expected-S rule choose. t15 (real data, untrimmed
+    # 72 MB embedding) paid for the held fine embedding (f0.8 +1.2%, wave-B candidate +~2% vs 2bfa93f), t23 / t05 gained
+    # from a finer one (f0.8 -14% / -5%): the right constant is task-specific, so it is measured, one eval per option.
+    if os.environ.get("QUANT_FF_EMB_SEARCH", "0") == "1" and tgt is not None and final is not None and emb_own_c \
+            and getattr(alloc, "fixed_c", None) and deadline.left() > 300 + dq_reserve:
+        c_e0 = next(iter(alloc.fixed_c.values()))
+        facs = [float(x) for x in os.environ.get("QUANT_FF_EMB_SEARCH_F", "0.8,1.25,1.6").split(",") if x]
+        names = [n for n in names_2d if n in params]
+        set_weights(model, {n: final["lin"][n] for n in names}, 0)
+        t_es = time.time()
+        for f_ in facs:
+            if deadline.left() < 240 + dq_reserve:
+                log.info("EMBSEARCH: out of time")
+                break
+            t0 = time.time()
+            alloc.fixed_c = {n: c_e0 * f_ for n in embed_names}
+            st_e = alloc.steps(c_e0)
+            emb_q = {n: ecq.rtn_u(base.tensor(n), st_e[n], device=device) for n in embed_names if n in names}
+            set_weights(model, emb_q, 0)
+            r_, sigma_ = measure()
+            lin_e = dict(final["lin"])
+            lin_e.update(emb_q)
+            entries = [ffcodec.Entry(name, shape, q=lin_e[name]) if name in lin_e else ffcodec.Entry(name, shape, tensor=base.tensor(name))
+                       for name, shape in base.shapes.items()]
+            _, _, est = consider(final["name"] + f"-emb{f_:g}", entries, r_ + bias, sigma=sigma_)
+            log.info("EMBSEARCH factor %.3g (c %.4g): r %.4f, ~%.1f MB, %.0fs", f_, c_e0 * f_, r_, est / 1e6, time.time() - t0)
+            del entries, lin_e
+            set_weights(model, {n: final["lin"][n] for n in embed_names if n in names}, 0)
+        alloc.fixed_c = {n: c_e0 for n in embed_names}
+        log.info("EMBSEARCH done in %.0fs", time.time() - t_es)
+        gc.collect()
     # Lever 2c (QUANT_FF_BLOCK_PICK=1): GPTQ outcomes at the same steps differ a lot (t23, 25 Nov: r 1.0381 vs 1.0267 at
     # c 1.042e-5 / 1.065e-5), while one model's calibration and test r agree within ~0.0025. A second GPTQ draw B at the
     # shipped candidate's exact steps (Hessians from the next QUANT_GPTQ_ROWS train rows) is made; each decoder block takes
