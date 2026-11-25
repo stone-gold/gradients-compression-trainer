@@ -870,6 +870,110 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
     # bracket's middle c on the new allocation. t15 (25 Nov): single-block costs ranged -0.0006..+0.0020 r for ~0.63 MB each.
     realloc = os.environ.get("QUANT_FF_BLOCK_REALLOC", "0") == "1"
     realloc_done = False
+    eval_t = None
+
+    def split_r() -> tuple[float, float, float]:
+        """(r all rows, r even rows, r odd rows) of the weights in the model."""
+        with torch.no_grad():
+            rl = row_losses(model, eval_rows)
+        def rr(ix):
+            a = [rl[i] for i in ix if rl[i] == rl[i] and ref_rows[i] == ref_rows[i]]
+            b = [ref_rows[i] for i in ix if rl[i] == rl[i] and ref_rows[i] == ref_rows[i]]
+            return sum(a) / max(1e-12, sum(b))
+        n = len(rl)
+        return rr(range(n)), rr(range(0, n, 2)), rr(range(1, n, 2))
+
+    def even_r() -> float:
+        """r on the even calibration rows only (half the eval time)."""
+        ev = eval_rows[0::2]
+        with torch.no_grad():
+            rl = row_losses(model, ev)
+        ref = ref_rows[0::2]
+        a = [x for x, y in zip(rl, ref) if x == x and y == y]
+        b = [y for x, y in zip(rl, ref) if x == x and y == y]
+        return sum(a) / max(1e-12, sum(b))
+
+    def block_pick(fin: dict) -> None:
+        nonlocal eval_t
+        t_all = time.time()
+        st = fin["steps"]
+        off = int(os.environ.get("QUANT_GPTQ_ROWS", 256))
+        alt = pool[off : 2 * off] if len(pool) >= off + 64 else pool[::-1][:off]
+        samples_b = [torch.tensor(r_.input_ids) for r_ in alt]
+        restore()
+
+        def qz(name, w, H):
+            if H is None:
+                return rtn_lin(name, w, st[name])
+            act = os.environ.get("QUANT_ECQ_ACT_ORDER", "1") == "1"
+            if use_dq and not is_embed_like(name):
+                d = dq_step(w, st[name])
+                kw = {}
+                if dq_lam > 0:
+                    bits, cls = dq.rate_model(w, d, H.device, dq_rate_cols)
+                    kw = {"lam": dq_lam, "bits": bits, "cls": cls}
+                return dq.gptq_dq(w, H, d, damp=damp, blocksize=dq_block, act_order=dq_order if act else False, **kw)
+            return ecq.gptq_u(w, H, st[name], damp=damp, act_order=act, rdo=rdo)
+
+        def gqz(names, ws, H):
+            if use_dq and not any(is_embed_like(n) for n in names):
+                sizes = [w.shape[0] for w in ws]
+                wcat = torch.cat(ws, 0)
+                d = torch.cat([dq_step(w, st[n]) for n, w in zip(names, ws)])
+                kw = {}
+                if dq_lam > 0:
+                    bits, cls = dq.rate_model(wcat, d, H.device, dq_rate_cols)
+                    kw = {"lam": dq_lam, "bits": bits, "cls": cls}
+                u = dq.gptq_dq(wcat, H, d, damp=damp, blocksize=dq_block, act_order=dq_order, split=sizes, **kw)
+                out, r0 = [], 0
+                for i, sz in enumerate(sizes):
+                    out.append(ecq.UResult(u.codes[r0 : r0 + sz].contiguous(), u.step[r0 : r0 + sz].contiguous(), dq=True, perm=u.perm, okey=u.okey,
+                                           chunk=u.chunk, est=u.est[i]))
+                    r0 += sz
+                return out
+            return [qz(n, w, H) for n, w in zip(names, ws)]
+
+        lin_b = quantize_model_gptq(model, samples_b, QSpec(bits=8, group=1), damp=damp, true_sequential=True, time_left=lambda: deadline.left() - 300,
+                                    quantizer=qz, group_quantizer=gqz if use_dq else None)
+        lin_b = {n: q for n, q in lin_b.items() if n in base.shapes and not is_embed_like(n)}
+        lin_a = fin["lin"]
+        for n in names_2d:
+            if n not in lin_b:
+                lin_b[n] = lin_a[n]
+        names = [n for n in names_2d if n in params]
+        set_weights(model, {n: lin_b[n] for n in names}, 0)
+        rb_all, rb_e, rb_o = split_r()
+        set_weights(model, {n: lin_a[n] for n in names}, 0)
+        t0 = time.time()
+        ra_all, ra_e, ra_o = split_r()
+        eval_t = time.time() - t0
+        log.info("BLOCKPICK draw B (%d alt rows): r %.4f (even %.4f odd %.4f) vs A %s r %.4f (even %.4f odd %.4f), B probe+evals %.0fs",
+                 len(samples_b), rb_all, rb_e, rb_o, fin["name"], ra_all, ra_e, ra_o, time.time() - t_all)
+        pick = []
+        for b in sorted({unit_of(n) for n in names if unit_of(n) >= 0}):
+            if deadline.left() < 400 + dq_reserve:
+                log.info("BLOCKPICK: out of time at block %d", b)
+                return
+            ns = [n for n in names if unit_of(n) == b]
+            set_weights(model, {n: lin_b[n] for n in ns}, 0)
+            re_ = even_r()
+            set_weights(model, {n: lin_a[n] for n in ns}, 0)
+            if re_ < ra_e:
+                pick.append(b)
+            log.info("BLOCKPICK block %d: even-row dr %+.5f", b, re_ - ra_e)
+        if not pick:
+            return
+        comb = {n: (lin_b[n] if unit_of(n) in pick else lin_a[n]) for n in names_2d}
+        set_weights(model, {n: comb[n] for n in names}, 0)
+        rc_all, rc_e, rc_o = split_r()
+        log.info("BLOCKPICK combined (%d blocks from B): r %.4f even %.4f odd %.4f (A odd %.4f): %s", len(pick), rc_all, rc_e, rc_o, ra_o,
+                 "accepted" if rc_o < ra_o else "rejected")
+        if rc_o >= ra_o:
+            return
+        r_, sigma_ = measure()
+        entries = [ffcodec.Entry(name, shape, q=comb[name]) if name in comb else ffcodec.Entry(name, shape, tensor=base.tensor(name))
+                   for name, shape in base.shapes.items()]
+        consider(fin["name"] + f"-pick{len(pick)}", entries, r_ + bias, sigma=sigma_)
 
     def block_realloc(lo: dict, hi: dict) -> bool:
         os.environ["QUANT_FF_UNIT_SWAP_SETS"] = "blocks"
@@ -981,7 +1085,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             records, frames, est = consider(f"ecq-{alloc.kind}-c{c:.4g}", entries, r + bias, sigma=sigma)
             sc = tgt.expected_ln_s(est, 1.0 + (r - 1.0) * (1.0 - tune_f) + bias, sigma)
             if final is None or sc < final["score"]:
-                final = {"lin": lin, "r": r, "name": f"ecq-{alloc.kind}-c{c:.4g}", "score": sc}
+                final = {"lin": lin, "r": r, "name": f"ecq-{alloc.kind}-c{c:.4g}", "score": sc, "steps": steps}
             size_pts.append((r, est))
             sigma_now = sigma
             # the aim's slope is clamped to [-QUANT_FF_AIM_SLOPE_MAX, -2] (default 8 = the prior slope, aim ~1.0396 r_cal: real
@@ -991,7 +1095,7 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             aim_slope = max(-float(os.environ.get("QUANT_FF_AIM_SLOPE_MAX", 8.0)), landing.bytes_slope(size_pts))
             aim = pre(tgt.aim(sigma, aim_slope / (1.0 - tune_f)) - bias)
             log.info("landing aim r_cal %.4f (sigma %.4f, slope %.2f, used %.2f)", aim, sigma, landing.bytes_slope(size_pts), aim_slope)
-            cand = {"c": c, "r": r, "sigma": sigma, "lin": lin, "enc": split_encoded(records, frames)}
+            cand = {"c": c, "r": r, "sigma": sigma, "lin": lin, "enc": split_encoded(records, frames), "steps": steps}
             side = "lo" if r <= aim else "hi"
             other = "hi" if side == "lo" else "lo"
             cur = keep.get(side)
@@ -1088,7 +1192,8 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
             del mix_entries
             sc = tgt.expected_ln_s(est, 1.0 + (r - 1.0) * (1.0 - tune_f) + bias, sigma)
             if final is None or sc < final["score"]:
-                final = {"lin": {n: src_of[n]["lin"][n] for n in names_2d}, "r": r, "name": mname, "score": sc}
+                final = {"lin": {n: src_of[n]["lin"][n] for n in names_2d}, "r": r, "name": mname, "score": sc,
+                         "steps": {n: src_of[n]["steps"][n] for n in names_2d}}
             size_pts.append((r, est))
             eval_time = time.time() - t0
             log.info("ECQ mix %d: %d/%d units from c %.4g, r %.4f (sigma %.4f), ~%.1f MB, %.0fs", j, m, len(units), hi["c"], r, sigma, est / 1e6, eval_time)
@@ -1101,6 +1206,18 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 break
     keep.clear()
     gc.collect()
+    # Lever 2c (QUANT_FF_BLOCK_PICK=1): GPTQ outcomes at the same steps differ a lot (t23, 25 Nov: r 1.0381 vs 1.0267 at
+    # c 1.042e-5 / 1.065e-5), while one model's calibration and test r agree within ~0.0025. A second GPTQ draw B at the
+    # shipped candidate's exact steps (Hessians from the next QUANT_GPTQ_ROWS train rows) is made; each decoder block takes
+    # B's codes when its single-block swap lowers r on the EVEN calibration rows; the combined model is accepted only if
+    # its r on the ODD rows (not used for the choice) is lower than the candidate's there, and then competes in consider().
+    if os.environ.get("QUANT_FF_BLOCK_PICK", "0") == "1" and tgt is not None and final is not None and final.get("steps") \
+            and probe_time is not None and deadline.left() > probe_time * 1.25 + 30 * 0.6 * (eval_t or 25) + 330 + dq_reserve:
+        try:
+            block_pick(final)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("block pick failed: %r", exc)
+        gc.collect()
     # Optional tuning stage (QUANT_FF_TUNE=1): the search above aimed QUANT_FF_TUNE_F of the excess higher (see aim), so the
     # tuned candidate should land near the real aim; it is shipped only if its measured expected S is lower.
     if tgt is not None and tune_f > 0 and final is not None and deadline.left() > 420:
