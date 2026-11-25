@@ -819,6 +819,82 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         x = min(x1 + 0.8 * (x2 - x1), max(x1 + 0.2 * (x2 - x1), x))  # stay inside the bracket
         return math.exp(x)
 
+    def name_bytes(p: dict, n: str) -> int:
+        q = p["lin"].get(n)
+        if q is not None and getattr(q, "dq", False) and isinstance(getattr(q, "est", None), int):
+            return q.est
+        return sum(len(f) for f in p["enc"][n][1])
+
+    def unit_swaps(lo: dict, hi: dict) -> dict:
+        """Instrumentation for the measured per-unit allocation (lever 2, QUANT_FF_UNIT_SWAP=1): from the lo probe, swap
+        ONE unit at a time to the hi probe's codes and measure r on the calibration rows (paired rows), giving each
+        unit's bytes saved and r cost. Units: the decoder blocks, then the module groups (q/k/v/o/gate/up/down across
+        all blocks), then all at once (additivity check). One "UNITSWAP {json}" line per eval; the model is left at lo."""
+        names = [n for n in names_2d if n in params]
+        sets = []
+        for b in sorted({unit_of(n) for n in names if unit_of(n) >= 0}):
+            sets.append((f"block{b}", [n for n in names if unit_of(n) == b]))
+        only_blocks = os.environ.get("QUANT_FF_UNIT_SWAP_SETS", "all") == "blocks"
+        for g in ([] if only_blocks else sorted({group_key(n) for n in names if unit_of(n) >= 0})):
+            sets.append((f"group:{g}", [n for n in names if unit_of(n) >= 0 and group_key(n) == g]))
+        emb = [n for n in names if unit_of(n) < 0]
+        if emb and any(not torch.equal(lo["lin"][n].codes, hi["lin"][n].codes) for n in emb if n in lo["lin"] and n in hi["lin"]):
+            sets.append(("emb", emb))
+        if not only_blocks:
+            sets.append(("all", names))
+        meas = {}
+        lo_b = {n: name_bytes(lo, n) for n in names}
+        hi_b = {n: name_bytes(hi, n) for n in names}
+        set_weights(model, {n: lo["lin"][n] for n in names}, 0)
+        r0, s0 = measure()
+        log.info("UNITSWAP %s", json.dumps({"unit": "lo", "r": r0, "c_lo": lo["c"], "c_hi": hi["c"], "r_lo_probe": lo["r"], "r_hi_probe": hi["r"],
+                                            "bytes_lo": sum(lo_b.values()), "bytes_hi": sum(hi_b.values())}))
+        t_sw = time.time()
+        for u, ns in sets:
+            if deadline.left() < 600 + dq_reserve:
+                log.info("UNITSWAP: out of time at %s", u)
+                break
+            t0 = time.time()
+            set_weights(model, {n: hi["lin"][n] for n in ns}, 0)
+            r1, _ = measure()
+            set_weights(model, {n: lo["lin"][n] for n in ns}, 0)
+            meas[u] = (r1 - r0, sum(lo_b[n] - hi_b[n] for n in ns))
+            log.info("UNITSWAP %s", json.dumps({"unit": u, "n": len(ns), "r": r1, "dr": r1 - r0, "dB": sum(lo_b[n] - hi_b[n] for n in ns),
+                                                "B_lo": sum(lo_b[n] for n in ns), "s": round(time.time() - t0, 1)}))
+        log.info("UNITSWAP done: %d sets in %.0fs", len(sets), time.time() - t_sw)
+        return meas
+
+    # lever 2b (QUANT_FF_BLOCK_REALLOC=1): once a lo / hi bracket exists, measure each decoder block's swap lo -> hi alone
+    # (bytes saved, r cost on the paired calibration rows) and re-allocate: block b's steps x (eff_b / mean eff)^alpha,
+    # clamped, normalised so the bytes-weighted log factor is 0 (bytes ~unchanged); the search then restarts from the
+    # bracket's middle c on the new allocation. t15 (25 Nov): single-block costs ranged -0.0006..+0.0020 r for ~0.63 MB each.
+    realloc = os.environ.get("QUANT_FF_BLOCK_REALLOC", "0") == "1"
+    realloc_done = False
+
+    def block_realloc(lo: dict, hi: dict) -> bool:
+        os.environ["QUANT_FF_UNIT_SWAP_SETS"] = "blocks"
+        meas = unit_swaps(lo, hi)
+        bl = sorted({unit_of(n) for n in names_2d if unit_of(n) >= 0})
+        if not all(f"block{b}" in meas for b in bl):
+            return False
+        floor = float(os.environ.get("QUANT_FF_REALLOC_DR_FLOOR", 2e-4))
+        al = float(os.environ.get("QUANT_FF_REALLOC_ALPHA", 0.5))
+        lo_f, hi_f = float(os.environ.get("QUANT_FF_REALLOC_MIN", 0.8)), float(os.environ.get("QUANT_FF_REALLOC_MAX", 1.25))
+        eff = {b: max(1.0, meas[f"block{b}"][1]) / max(floor, meas[f"block{b}"][0]) for b in bl}
+        wts = {b: sum(name_bytes(lo, n) for n in names_2d if unit_of(n) == b) for b in bl}
+        tot = sum(wts.values())
+        gm = math.exp(sum(wts[b] * math.log(eff[b]) for b in bl) / tot)
+        f = {b: min(hi_f, max(lo_f, (eff[b] / gm) ** al)) for b in bl}
+        # step factor f -> ~ -log2(f) bits per weight: centre the bytes-weighted log so the total rate stays put
+        mlog = sum(wts[b] * math.log(f[b]) for b in bl) / tot
+        f = {b: math.exp(math.log(v) - mlog) for b, v in f.items()}
+        for n in names_2d:
+            b = unit_of(n)
+            if b >= 0:
+                alloc.base[n] = alloc.base[n] * f[b]
+        log.info("block realloc factors: %s", ",".join(f"{b}:{f[b]:.3f}" for b in bl))
+        return True
+
     for k in range(max_probes):
         # GPTQ itself switches to RTN when less than ~1.2 x its time is left beyond a 300 s margin: never start a probe
         # that would degrade that way (it costs time and lands nowhere useful)
@@ -933,6 +1009,20 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         probe_time = time.time() - t0
         del entries, lin
         gc.collect()
+        if realloc and not realloc_done and tgt is not None and "lo" in keep and "hi" in keep and \
+                deadline.left() > 28 * 25 + 2 * (probe_time or 300) * 1.2 + 330 + dq_reserve:
+            realloc_done = True
+            try:
+                changed = block_realloc(keep["lo"], keep["hi"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("block realloc failed: %r", exc)
+                changed = False
+            if changed:
+                c = math.sqrt(keep["lo"]["c"] * keep["hi"]["c"])
+                keep.clear()
+                history.clear()
+                gc.collect()
+                continue
         if abs(r - aim) <= tol:
             break
         if tgt is not None and "lo" in keep and "hi" in keep and keep["hi"]["c"] / keep["lo"]["c"] <= float(os.environ.get("QUANT_FF_MIX_WIDTH", 1.3)):
@@ -941,46 +1031,6 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         nb = bracket_next(c) if tgt is not None else None
         # secant in log space: log(r - 1) = a log c + b (a ~ 2 for uniform noise); one point -> a = 2
         c = nb if nb is not None else next_gptq_c(history, rtn_hist, aim, c, r)
-
-    def name_bytes(p: dict, n: str) -> int:
-        q = p["lin"].get(n)
-        if q is not None and getattr(q, "dq", False) and isinstance(getattr(q, "est", None), int):
-            return q.est
-        return sum(len(f) for f in p["enc"][n][1])
-
-    def unit_swaps(lo: dict, hi: dict) -> None:
-        """Instrumentation for the measured per-unit allocation (lever 2, QUANT_FF_UNIT_SWAP=1): from the lo probe, swap
-        ONE unit at a time to the hi probe's codes and measure r on the calibration rows (paired rows), giving each
-        unit's bytes saved and r cost. Units: the decoder blocks, then the module groups (q/k/v/o/gate/up/down across
-        all blocks), then all at once (additivity check). One "UNITSWAP {json}" line per eval; the model is left at lo."""
-        names = [n for n in names_2d if n in params]
-        sets = []
-        for b in sorted({unit_of(n) for n in names if unit_of(n) >= 0}):
-            sets.append((f"block{b}", [n for n in names if unit_of(n) == b]))
-        for g in sorted({group_key(n) for n in names if unit_of(n) >= 0}):
-            sets.append((f"group:{g}", [n for n in names if unit_of(n) >= 0 and group_key(n) == g]))
-        emb = [n for n in names if unit_of(n) < 0]
-        if emb and any(not torch.equal(lo["lin"][n].codes, hi["lin"][n].codes) for n in emb if n in lo["lin"] and n in hi["lin"]):
-            sets.append(("emb", emb))
-        sets.append(("all", names))
-        lo_b = {n: name_bytes(lo, n) for n in names}
-        hi_b = {n: name_bytes(hi, n) for n in names}
-        set_weights(model, {n: lo["lin"][n] for n in names}, 0)
-        r0, s0 = measure()
-        log.info("UNITSWAP %s", json.dumps({"unit": "lo", "r": r0, "c_lo": lo["c"], "c_hi": hi["c"], "r_lo_probe": lo["r"], "r_hi_probe": hi["r"],
-                                            "bytes_lo": sum(lo_b.values()), "bytes_hi": sum(hi_b.values())}))
-        t_sw = time.time()
-        for u, ns in sets:
-            if deadline.left() < 600 + dq_reserve:
-                log.info("UNITSWAP: out of time at %s", u)
-                break
-            t0 = time.time()
-            set_weights(model, {n: hi["lin"][n] for n in ns}, 0)
-            r1, _ = measure()
-            set_weights(model, {n: lo["lin"][n] for n in ns}, 0)
-            log.info("UNITSWAP %s", json.dumps({"unit": u, "n": len(ns), "r": r1, "dr": r1 - r0, "dB": sum(lo_b[n] - hi_b[n] for n in ns),
-                                                "B_lo": sum(lo_b[n] for n in ns), "s": round(time.time() - t0, 1)}))
-        log.info("UNITSWAP done: %d sets in %.0fs", len(sets), time.time() - t_sw)
 
     # Layer mix (landing mode): with a probe under the aim (lo) and one over it (hi), take the first m mixing units
     # (decoder blocks, embeddings last) from hi and the rest from lo. r and bytes move in ~1/units steps between the two
@@ -998,11 +1048,23 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         blocks = [n for n in names_2d if unit_of(n) >= 0]
         units = sorted({ukey(n) for n in blocks}) + sorted({ukey(n) for n in names_2d if unit_of(n) < 0})
         unit_of_name = {n: ukey(n) for n in names_2d}
-        if os.environ.get("QUANT_FF_UNIT_SWAP", "0") == "1":
+        # lever 2 (QUANT_FF_MIX_ORDER=gain): measure each block's swap lo -> hi alone (one eval per block on the paired
+        # calibration rows) and mix the blocks in order of bytes saved per unit r (knapsack order), not block order
+        order_gain = os.environ.get("QUANT_FF_MIX_ORDER", "block") == "gain"
+        meas = {}
+        if os.environ.get("QUANT_FF_UNIT_SWAP", "0") == "1" or order_gain:
             try:
-                unit_swaps(lo, hi)
+                meas = unit_swaps(lo, hi)
             except Exception as exc:  # noqa: BLE001 - instrumentation only: the mix below still runs
                 log.warning("UNITSWAP failed: %r", exc)
+        if order_gain and all(f"block{b}" in meas for b in {unit_of(n) for n in blocks}):
+            def eff(b):
+                dr, dB = meas[f"block{b}"]
+                return float("inf") if dr <= 0 else dB / dr
+            rank = {b: i for i, b in enumerate(sorted({unit_of(n) for n in blocks}, key=lambda b: -eff(b)))}
+            units = sorted({ukey(n) for n in blocks}, key=lambda u: (rank[u[0] if isinstance(u, tuple) else u], u)) + \
+                sorted({ukey(n) for n in names_2d if unit_of(n) < 0})
+            log.info("ECQ mix order by measured gain: %s", ",".join(str(b) for b in sorted(rank, key=rank.get)))
         m_lo, r_lo, m_hi, r_hi = 0, lo["r"], len(units), hi["r"]
         tol_mix = float(os.environ.get("QUANT_FF_MIX_TOL", 0.0008))
         eval_time = None
