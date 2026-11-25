@@ -669,7 +669,12 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         hw = model.get_output_embeddings().weight
         head_name = next((n for n in embed_names if n in params and params[n] is hw), None)
         if head_name is not None:
-            head_H = head_hessian(model, [r for r in pool if r.n_scored > 0], int(os.environ.get("QUANT_GPTQ_ROWS", 256)))
+            try:
+                head_H = head_hessian(model, [r for r in pool if r.n_scored > 0], int(os.environ.get("QUANT_GPTQ_ROWS", 256)))
+            except Exception as exc:  # noqa: BLE001 - the embeddings then stay RTN (864ff23 behaviour)
+                log.warning("EMBGPTQ: head Hessian failed (%r): embeddings stay RTN", exc)
+                head_H = None
+                torch.cuda.empty_cache()
         if head_H is not None:
             rows_n = base.shapes[head_name][0]
             cnt = torch.zeros(rows_n, dtype=torch.long)
@@ -698,9 +703,20 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
         key = (n, int(m.sum()), hash(st.float().numpy().tobytes()), hash(m.numpy().tobytes()), id(getattr(base, "overrides", {}).get(n)))
         if emb_cache.get("key") == key:
             return emb_cache["res"]
-        g = ecq.gptq_u(w[m], head_H, st[m], damp=emb_damp, act_order=True)
-        codes = res.codes.clone()
-        codes[m] = g.codes
+        try:
+            # GPTQ is row-separable: rows go in chunks of ~2.5e8 weights (one chunk up to 162k rows at width 1536), so the
+            # working memory stays bounded on wide models
+            idx = torch.nonzero(m).view(-1)
+            per = max(8192, int(2.5e8 // max(1, w.shape[1])))
+            codes = res.codes.clone()
+            for i0 in range(0, idx.numel(), per):
+                ii = idx[i0 : i0 + per]
+                codes[ii] = ecq.gptq_u(w[ii], head_H, st[ii], damp=emb_damp, act_order=True).codes
+        except Exception as exc:  # noqa: BLE001 - e.g. out of memory on a large model: RTN rows from here on
+            log.warning("EMBGPTQ: GPTQ of %d rows of %s failed (%r): RTN for these rows from now on", int(m.sum()), n, exc)
+            emb_gptq[n] = torch.zeros_like(m)
+            torch.cuda.empty_cache()
+            return res
         out = ecq.UResult(codes, res.step)
         emb_cache.update(key=key, res=out)
         return out
@@ -1317,14 +1333,21 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 sets the allocation / overrides for that option. Keeps the option with the best block-equivalent score."""
                 t_s = time.time()
                 first = options[0]
-                sc_ = {first: (cur[0], cur[1], cur[2], emb_bytes_best(cur[2]))}
-                for o_ in options[1:]:
-                    apply(o_)
-                    st_o = alloc.steps(c)
-                    q_o = {n_: q_emb(n_, st_o[n_]) for n_ in cur[2]}
-                    set_weights(model, q_o, 0)
-                    r_o, s_o = measure()
-                    sc_[o_] = (r_o, s_o, q_o, emb_bytes_best(q_o))
+                try:
+                    sc_ = {first: (cur[0], cur[1], cur[2], emb_bytes_best(cur[2]))}
+                    for o_ in options[1:]:
+                        apply(o_)
+                        st_o = alloc.steps(c)
+                        q_o = {n_: q_emb(n_, st_o[n_]) for n_ in cur[2]}
+                        set_weights(model, q_o, 0)
+                        r_o, s_o = measure()
+                        sc_[o_] = (r_o, s_o, q_o, emb_bytes_best(q_o))
+                except Exception as exc:  # noqa: BLE001 - a failed scan leaves the first option (the state before the scan) in place
+                    log.warning("%s: scan failed (%r): keeping %s", tag, exc, first)
+                    apply(first)
+                    set_weights(model, cur[2], 0)
+                    torch.cuda.empty_cache()
+                    return cur
 
                 def score_(o_):
                     return math.log(rest + sc_[o_][3]) - k_blk * share * (sc_[first][0] - sc_[o_][0])
