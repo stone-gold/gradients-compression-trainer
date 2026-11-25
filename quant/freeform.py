@@ -908,10 +908,11 @@ def run_ecq(args, deadline, target, base, names_2d, consider, best, margin, devi
                 final = {"lin": lin, "r": r, "name": f"ecq-{alloc.kind}-c{c:.4g}", "score": sc}
             size_pts.append((r, est))
             sigma_now = sigma
-            # the aim's slope is clamped to [-QUANT_FF_AIM_SLOPE_MAX, -2] (default 14 = DQ's own measured t23 slope): with the
+            # the aim's slope is clamped to [-QUANT_FF_AIM_SLOPE_MAX, -2] (default 8 = the prior slope, aim ~1.0396 r_cal: real
+            # data is ~2x more r-sensitive than the CNN proxy (T1), so the aim stays at ~1.039-1.040 as in 2bfa93f): with the
             # embeddings held, two block probes 1.25x apart can differ by ~0.001 r (probe noise), and the fitted slope (-40 on
             # t23, 25 Nov 16:15) put the aim at r 1.047, past the 1.046 guard (G3)
-            aim_slope = max(-float(os.environ.get("QUANT_FF_AIM_SLOPE_MAX", 14.0)), landing.bytes_slope(size_pts))
+            aim_slope = max(-float(os.environ.get("QUANT_FF_AIM_SLOPE_MAX", 8.0)), landing.bytes_slope(size_pts))
             aim = pre(tgt.aim(sigma, aim_slope / (1.0 - tune_f)) - bias)
             log.info("landing aim r_cal %.4f (sigma %.4f, slope %.2f, used %.2f)", aim, sigma, landing.bytes_slope(size_pts), aim_slope)
             cand = {"c": c, "r": r, "sigma": sigma, "lin": lin, "enc": split_encoded(records, frames)}
